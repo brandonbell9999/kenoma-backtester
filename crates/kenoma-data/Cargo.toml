@@ -1,0 +1,26 @@
+[package]
+name = "kenoma-data"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+dbn = ["dep:dbn"]
+parquet = ["dep:arrow", "dep:parquet"]
+
+[dependencies]
+kenoma-book.workspace = true
+kenoma-types.workspace = true
+anyhow.workspace = true
+arrow = { workspace = true, optional = true }
+csv.workspace = true
+parquet = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+dbn = { version = "0.50", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

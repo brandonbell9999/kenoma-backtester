@@ -1,0 +1,17 @@
+[package]
+name = "kenoma-backtester"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kenoma-audit.workspace = true
+kenoma-book.workspace = true
+kenoma-data.workspace = true
+kenoma-engine.workspace = true
+kenoma-execution.workspace = true
+kenoma-options.workspace = true
+kenoma-portfolio.workspace = true
+kenoma-stats.workspace = true
+kenoma-types.workspace = true

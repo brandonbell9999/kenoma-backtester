@@ -1,0 +1,11 @@
+[package]
+name = "kenoma-options"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kenoma-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true

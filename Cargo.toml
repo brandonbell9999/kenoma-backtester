@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kenoma-types",
+    "crates/kenoma-audit",
+    "crates/kenoma-book",
+    "crates/kenoma-execution",
+    "crates/kenoma-portfolio",
+    "crates/kenoma-options",
+    "crates/kenoma-stats",
+    "crates/kenoma-data",
+    "crates/kenoma-engine",
+    "crates/kenoma-backtester",
+    "crates/kenoma-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Kenoma Labs"]
+license = "MIT"
+
+[workspace.dependencies]
+kenoma-types = { path = "crates/kenoma-types" }
+kenoma-audit = { path = "crates/kenoma-audit" }
+kenoma-book = { path = "crates/kenoma-book" }
+kenoma-execution = { path = "crates/kenoma-execution" }
+kenoma-portfolio = { path = "crates/kenoma-portfolio" }
+kenoma-options = { path = "crates/kenoma-options" }
+kenoma-stats = { path = "crates/kenoma-stats" }
+kenoma-data = { path = "crates/kenoma-data" }
+kenoma-engine = { path = "crates/kenoma-engine" }
+
+anyhow = "1"
+arrow = "58"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+parquet = "58"
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+toml = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,35 @@
+[run]
+id = "bar-smoke"
+
+[[data]]
+kind = "bar_csv"
+path = "examples/bar_smoke.csv"
+
+[[universe]]
+id = 1
+symbol = "ABC"
+asset_class = "equity"
+tick_size = 0.01
+lot_size = 1.0
+multiplier = 1.0
+quote_currency = "USD"
+
+[portfolio]
+initial_capital = 10000.0
+base_currency = "USD"
+
+[strategy]
+name = "buy_first_bar"
+
+[strategy.params]
+instrument_id = 1
+qty = 10.0
+
+[execution]
+policy = "conservative_causal"
+
+[validation]
+strict = false
+
+[output]
+dir = "target/kenoma-runs/bar-smoke"

@@ -1,0 +1,11 @@
+[package]
+name = "kenoma-execution"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+kenoma-book.workspace = true
+kenoma-types.workspace = true
+serde.workspace = true
