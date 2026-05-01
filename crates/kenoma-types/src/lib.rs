@@ -548,7 +548,15 @@ pub struct RunMetrics {
     pub end_equity: f64,
     pub total_return: f64,
     pub max_drawdown: f64,
+    /// Per-period Sharpe (NOT annualized).
     pub sharpe: f64,
+    /// Annualization factor used to compute `annualized_sharpe`, when set.
+    #[serde(default)]
+    pub sharpe_annualization: Option<f64>,
+    /// Annualized Sharpe (per-period × sqrt(factor)). Only populated when the
+    /// run manifest's `metrics.annualization_factor` was set.
+    #[serde(default)]
+    pub annualized_sharpe: Option<f64>,
     pub profit_factor: f64,
     pub total_fees: f64,
     pub trade_count: usize,
@@ -562,6 +570,8 @@ impl Default for RunMetrics {
             total_return: 0.0,
             max_drawdown: 0.0,
             sharpe: 0.0,
+            sharpe_annualization: None,
+            annualized_sharpe: None,
             profit_factor: 0.0,
             total_fees: 0.0,
             trade_count: 0,

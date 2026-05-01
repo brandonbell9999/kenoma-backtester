@@ -46,10 +46,9 @@ fn manifest(strict: bool) -> RunManifest {
             crate_path: None,
             params: BTreeMap::new(),
         },
-        execution: ExecutionConfig {
-            policy: "conservative_causal".to_string(),
-        },
+        execution: ExecutionConfig::default(),
         validation: ValidationConfig { strict },
+        metrics: kenoma_engine::MetricsManifestConfig::default(),
         output: OutputConfig {
             dir: PathBuf::from("target/stress-test"),
         },

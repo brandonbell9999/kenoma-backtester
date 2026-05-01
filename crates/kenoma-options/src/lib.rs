@@ -133,10 +133,24 @@ pub fn crr_binomial_price(
 ) -> Result<f64, OptionError> {
     validate_positive(input.spot, "spot")?;
     validate_positive(input.strike, "strike")?;
-    validate_positive(input.volatility, "volatility")?;
-    validate_positive(input.time_to_expiry_years, "time_to_expiry_years")?;
+    validate_nonnegative(input.volatility, "volatility")?;
+    validate_nonnegative(input.time_to_expiry_years, "time_to_expiry_years")?;
     if steps == 0 {
         return Err(OptionError::InvalidInput("steps"));
+    }
+    if input.time_to_expiry_years == 0.0 {
+        return Ok(intrinsic(input.kind, input.spot, input.strike));
+    }
+    if input.volatility == 0.0 {
+        let t = input.time_to_expiry_years;
+        let terminal_spot = input.spot * ((input.rate - input.dividend_yield) * t).exp();
+        let discounted =
+            (-input.rate * t).exp() * intrinsic(input.kind, terminal_spot, input.strike);
+        return Ok(if exercise == Exercise::American {
+            discounted.max(intrinsic(input.kind, input.spot, input.strike))
+        } else {
+            discounted
+        });
     }
 
     let dt = input.time_to_expiry_years / steps as f64;
@@ -175,11 +189,33 @@ pub fn implied_volatility_bsm(
     tolerance: f64,
     max_iterations: usize,
 ) -> Result<f64, OptionError> {
-    validate_positive(market_price, "market_price")?;
-    validate_nonnegative(tolerance, "tolerance")?;
+    validate_nonnegative(market_price, "market_price")?;
+    validate_positive(tolerance, "tolerance")?;
+    if max_iterations == 0 {
+        return Err(OptionError::InvalidInput("max_iterations"));
+    }
     validate_bsm_market_price(input, market_price, tolerance)?;
+    let lower = discounted_intrinsic(OptionInputs {
+        volatility: 0.0,
+        ..input
+    });
+    if (market_price - lower).abs() <= tolerance {
+        return Ok(0.0);
+    }
+
     let mut lo = 1e-6;
-    let mut hi = 5.0;
+    let mut hi = 1.0;
+    loop {
+        input.volatility = hi;
+        let hi_price = black_scholes_merton_price(input)?;
+        if hi_price + tolerance >= market_price {
+            break;
+        }
+        hi *= 2.0;
+        if hi > 20.0 {
+            return Err(OptionError::NoConvergence);
+        }
+    }
     for _ in 0..max_iterations {
         input.volatility = (lo + hi) / 2.0;
         let price = black_scholes_merton_price(input)?;
@@ -348,11 +384,45 @@ mod tests {
     }
 
     #[test]
+    fn crr_handles_zero_volatility_deterministic_limit() {
+        let price = crr_binomial_price(
+            OptionInputs {
+                volatility: 0.0,
+                ..call_input()
+            },
+            10,
+            Exercise::European,
+        )
+        .unwrap();
+        let expected = black_scholes_merton_price(OptionInputs {
+            volatility: 0.0,
+            ..call_input()
+        })
+        .unwrap();
+        assert!((price - expected).abs() < 1e-12);
+    }
+
+    #[test]
     fn iv_solver_round_trip() {
         let input = call_input();
         let price = black_scholes_merton_price(input).unwrap();
         let iv = implied_volatility_bsm(input, price, 1e-8, 100).unwrap();
         assert!((iv - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn iv_solver_accepts_zero_price_at_lower_bound() {
+        let input = OptionInputs {
+            kind: OptionKind::Call,
+            spot: 50.0,
+            strike: 100.0,
+            rate: 0.0,
+            dividend_yield: 0.0,
+            volatility: 0.2,
+            time_to_expiry_years: 1.0,
+        };
+        let iv = implied_volatility_bsm(input, 0.0, 1e-8, 100).unwrap();
+        assert_eq!(iv, 0.0);
     }
 
     #[test]

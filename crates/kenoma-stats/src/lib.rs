@@ -20,7 +20,16 @@ pub struct Metrics {
     pub end_equity: f64,
     pub total_return: f64,
     pub max_drawdown: f64,
+    /// Per-period Sharpe (mean / stdev of equity-curve returns). NOT
+    /// annualized — annualize separately using `annualized_sharpe` with the
+    /// correct factor for the equity curve's sampling frequency.
     pub sharpe: f64,
+    /// Annualization factor that was applied to `annualized_sharpe`, if any.
+    /// `None` means the caller did not request annualization.
+    pub sharpe_annualization: Option<f64>,
+    /// Annualized Sharpe = `sharpe` × `sqrt(annualization_factor)`. Only
+    /// populated when `MetricsConfig.annualization_factor` was set.
+    pub annualized_sharpe: Option<f64>,
     pub profit_factor: f64,
     pub trade_count: usize,
 }
@@ -33,13 +42,41 @@ impl Default for Metrics {
             total_return: 0.0,
             max_drawdown: 0.0,
             sharpe: 0.0,
+            sharpe_annualization: None,
+            annualized_sharpe: None,
             profit_factor: 0.0,
             trade_count: 0,
         }
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    /// Number of equity-curve return periods per year. Optional — when
+    /// `None`, only the per-period Sharpe is reported. Setting this is the
+    /// caller's contract that the equity curve is regularly sampled at the
+    /// implied frequency. Common values: 252 (daily), 252×6.5×60 (1-min RTH),
+    /// 252×6.5×3600 (1-sec RTH).
+    pub annualization_factor: Option<f64>,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            annualization_factor: None,
+        }
+    }
+}
+
 pub fn compute_metrics(equity_curve: &[EquityPoint], trade_pnls: &[TradePnl]) -> Metrics {
+    compute_metrics_with(equity_curve, trade_pnls, &MetricsConfig::default())
+}
+
+pub fn compute_metrics_with(
+    equity_curve: &[EquityPoint],
+    trade_pnls: &[TradePnl],
+    config: &MetricsConfig,
+) -> Metrics {
     if equity_curve.is_empty() {
         return Metrics::default();
     }
@@ -52,7 +89,10 @@ pub fn compute_metrics(equity_curve: &[EquityPoint], trade_pnls: &[TradePnl]) ->
     };
     let max_drawdown = max_drawdown(equity_curve);
     let returns = equity_returns(equity_curve);
-    let sharpe = sharpe_ratio(&returns, 252.0_f64.sqrt());
+    let sharpe = sharpe_ratio(&returns, 1.0);
+    let annualized_sharpe = config
+        .annualization_factor
+        .map(|factor| sharpe * factor.sqrt());
     let profit_factor = profit_factor(trade_pnls.iter().map(|t| t.pnl));
     Metrics {
         start_equity,
@@ -60,6 +100,8 @@ pub fn compute_metrics(equity_curve: &[EquityPoint], trade_pnls: &[TradePnl]) ->
         total_return,
         max_drawdown,
         sharpe,
+        sharpe_annualization: config.annualization_factor,
+        annualized_sharpe,
         profit_factor,
         trade_count: trade_pnls.len(),
     }
@@ -238,6 +280,17 @@ pub fn build_day_metas(dates: &[i32], bar_counts: &[usize], n_groups: usize) -> 
 }
 
 pub fn generate_splits(day_metas: &[DayMeta], config: &CpcvConfig) -> Vec<CpcvSplit> {
+    assert!(!day_metas.is_empty(), "day_metas must not be empty");
+    assert!(config.n_groups > 0, "n_groups must be > 0");
+    assert!(
+        config.k_test > 0 && config.k_test <= config.n_groups,
+        "k_test must be in 1..=n_groups"
+    );
+    assert!(
+        day_metas.iter().all(|meta| meta.group < config.n_groups),
+        "day_metas contain group outside configured range"
+    );
+
     combinations(config.n_groups, config.k_test)
         .into_iter()
         .enumerate()
@@ -312,7 +365,7 @@ fn is_purged_or_embargoed(day: &DayMeta, boundaries: &[TestBoundary], config: &C
         if day.cum_bar_end > purge_start && day.cum_bar_start < boundary.block_start {
             return true;
         }
-        let embargo_end = boundary.block_end + config.embargo_bars;
+        let embargo_end = boundary.block_end.saturating_add(config.embargo_bars);
         if day.cum_bar_start < embargo_end && day.cum_bar_end > boundary.block_end {
             return true;
         }
@@ -405,5 +458,56 @@ mod tests {
         for idx in &split.train_day_indices {
             assert!(!split.test_day_indices.contains(idx));
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "k_test must be in 1..=n_groups")]
+    fn cpcv_rejects_impossible_test_group_count() {
+        let dates = (0..5).collect::<Vec<_>>();
+        let bar_counts = vec![10; 5];
+        let metas = build_day_metas(&dates, &bar_counts, 5);
+        let _ = generate_splits(
+            &metas,
+            &CpcvConfig {
+                n_groups: 5,
+                k_test: 6,
+                purge_bars: 0,
+                embargo_bars: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn embargo_uses_saturating_end_boundary() {
+        let metas = vec![
+            DayMeta {
+                date: 0,
+                group: 0,
+                cum_bar_start: usize::MAX - 3,
+                cum_bar_end: usize::MAX - 2,
+                bar_count: 1,
+            },
+            DayMeta {
+                date: 1,
+                group: 1,
+                cum_bar_start: usize::MAX - 2,
+                cum_bar_end: usize::MAX - 1,
+                bar_count: 1,
+            },
+        ];
+        let splits = generate_splits(
+            &metas,
+            &CpcvConfig {
+                n_groups: 2,
+                k_test: 1,
+                purge_bars: 0,
+                embargo_bars: usize::MAX,
+            },
+        );
+        let split = splits
+            .iter()
+            .find(|split| split.test_groups == vec![0])
+            .unwrap();
+        assert!(split.train_day_indices.is_empty());
     }
 }
