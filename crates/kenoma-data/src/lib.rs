@@ -138,6 +138,10 @@ struct BarCsvRow {
     close: f64,
     #[serde(default)]
     volume: f64,
+    #[serde(default)]
+    vwap: Option<f64>,
+    #[serde(default)]
+    feature_cutoff_ts: Option<u64>,
 }
 
 pub fn read_bar_csv(path: impl AsRef<Path>) -> Result<Vec<MarketEvent>> {
@@ -156,8 +160,8 @@ pub fn read_bar_csv(path: impl AsRef<Path>) -> Result<Vec<MarketEvent>> {
             low: row.low,
             close: row.close,
             volume: row.volume,
-            vwap: None,
-            feature_cutoff_ts: Some(row.ts_close),
+            vwap: row.vwap,
+            feature_cutoff_ts: row.feature_cutoff_ts.or(Some(row.ts_close)),
         }));
     }
     events.sort_by_key(|event| (event.timestamp_ns(), event.priority()));
@@ -226,7 +230,7 @@ pub fn canonical_schema() -> CanonicalSchema {
             field("created_ts", "uint64", false),
             field("side", "enum", false),
             field("qty", "float64", false),
-            field("order_type", "struct", false),
+            field("order_type", "utf8", false),
             field("tag", "utf8", true),
         ],
         fills: vec![
@@ -676,6 +680,14 @@ mod tests {
         let schema = canonical_schema();
         assert!(schema.fills.iter().any(|field| field.name == "order_id"));
         assert!(schema.mbo.iter().any(|field| field.name == "price_fixed"));
+        assert_eq!(
+            schema
+                .orders
+                .iter()
+                .find(|field| field.name == "order_type")
+                .map(|field| field.dtype.as_str()),
+            Some("utf8")
+        );
     }
 
     #[test]
@@ -693,6 +705,34 @@ mod tests {
         write_jsonl_events(&path, &events).unwrap();
         let loaded = read_jsonl_events(&path).unwrap();
         assert_eq!(loaded, events);
+    }
+
+    #[test]
+    fn bar_csv_preserves_optional_schema_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bars.csv");
+        std::fs::write(
+            &path,
+            "instrument_id,ts_open,ts_close,open,high,low,close,volume,vwap,feature_cutoff_ts\n\
+             1,0,60,100.0,101.0,99.0,100.5,1000.0,100.25,55\n",
+        )
+        .unwrap();
+        let loaded = read_bar_csv(&path).unwrap();
+        assert_eq!(
+            loaded,
+            vec![MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 0,
+                ts_close: 60,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 1000.0,
+                vwap: Some(100.25),
+                feature_cutoff_ts: Some(55),
+            })]
+        );
     }
 
     #[cfg(feature = "parquet")]

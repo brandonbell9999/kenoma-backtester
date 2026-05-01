@@ -2,19 +2,24 @@
 
 use anyhow::{Context as AnyhowContext, Result};
 use kenoma_audit::{AuditSeverity, AuditTrail, ValidationMode};
+use kenoma_book::BookBuilder;
 use kenoma_data::{load_sources, DataSourceConfig};
 use kenoma_data::{
     write_equity_curve_parquet, write_fills_parquet, write_orders_parquet, write_positions_parquet,
 };
-use kenoma_execution::ConservativeCausalFillModel;
+use kenoma_execution::{
+    BarFillMode, ConservativeCausalFillModel, ExecutionCosts, MboLimitFillTracker,
+};
 use kenoma_portfolio::Portfolio;
-use kenoma_stats::{compute_metrics, EquityPoint as StatsEquityPoint, TradePnl};
+use kenoma_stats::{
+    compute_metrics_with, EquityPoint as StatsEquityPoint, MetricsConfig, TradePnl,
+};
 use kenoma_types::{
     Bar, EquityPoint, Fill, InstrumentId, InstrumentSpec, MarketEvent, OrderRequest, Price, Quote,
     RunMetrics, RunReport, TimestampNs,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -92,7 +97,7 @@ impl<'a> StrategyContext<'a> {
 
     pub fn latest_bar(&mut self, instrument_id: InstrumentId, feature_name: &str) -> Option<Bar> {
         let bar = self.market_state.bars.get(&instrument_id)?.clone();
-        let cutoff = bar.feature_cutoff_ts.unwrap_or(bar.ts_close);
+        let cutoff = effective_cutoff_ts(&bar);
         self.audit
             .record_feature_cutoff(feature_name, cutoff, self.now)
             .ok()?;
@@ -170,16 +175,53 @@ pub struct StrategyConfig {
 pub struct ExecutionConfig {
     #[serde(default = "default_fill_policy_name")]
     pub policy: String,
+    #[serde(default)]
+    pub bar_fill_mode: BarFillMode,
+    #[serde(default = "default_fixed_spread_ticks")]
+    pub fixed_spread_ticks: f64,
+    #[serde(default)]
+    pub commission_per_side: f64,
+    #[serde(default)]
+    pub slippage_ticks: f64,
 }
 
 fn default_fill_policy_name() -> String {
     "conservative_causal".to_string()
 }
 
+fn default_fixed_spread_ticks() -> f64 {
+    1.0
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            policy: default_fill_policy_name(),
+            bar_fill_mode: BarFillMode::default(),
+            fixed_spread_ticks: default_fixed_spread_ticks(),
+            commission_per_side: 0.0,
+            slippage_ticks: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ValidationConfig {
     #[serde(default)]
     pub strict: bool,
+}
+
+/// Run-level metrics configuration.
+///
+/// `annualization_factor` is the number of equity-curve return periods per
+/// year. When set, the engine reports an `annualized_sharpe` alongside the
+/// per-period Sharpe. Leave it `None` (the default) for runs whose return
+/// frequency is unspecified or irregular — annualizing per-event returns by
+/// `sqrt(252)` is meaningless except for daily bars.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MetricsManifestConfig {
+    #[serde(default)]
+    pub annualization_factor: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -200,13 +242,13 @@ pub struct RunManifest {
     pub execution: ExecutionConfig,
     #[serde(default)]
     pub validation: ValidationConfig,
+    #[serde(default)]
+    pub metrics: MetricsManifestConfig,
     pub output: OutputConfig,
 }
 
 fn default_execution_config() -> ExecutionConfig {
-    ExecutionConfig {
-        policy: default_fill_policy_name(),
-    }
+    ExecutionConfig::default()
 }
 
 impl RunManifest {
@@ -252,7 +294,9 @@ pub struct BacktestEngine<S> {
     fill_model: ConservativeCausalFillModel,
     audit: AuditTrail,
     market_state: MarketState,
+    mbo_books: BTreeMap<InstrumentId, BookBuilder>,
     pending_orders: Vec<OrderRequest>,
+    mbo_limit_trackers: Vec<MboLimitFillTracker>,
     orders: Vec<OrderRequest>,
     fills: Vec<Fill>,
     equity_curve: Vec<EquityPoint>,
@@ -273,15 +317,28 @@ impl<S: Strategy> BacktestEngine<S> {
             manifest.portfolio.initial_capital,
         );
         let audit = AuditTrail::new(manifest.validation_mode());
+        let costs = ExecutionCosts {
+            commission_per_side: manifest.execution.commission_per_side,
+            spread_model: kenoma_execution::SpreadModel::Fixed,
+            fixed_spread_ticks: manifest.execution.fixed_spread_ticks,
+            slippage_ticks: manifest.execution.slippage_ticks,
+            bar_fill_mode: manifest.execution.bar_fill_mode,
+        };
+        let fill_model = ConservativeCausalFillModel {
+            policy: kenoma_execution::FillPolicy::ConservativeCausal,
+            costs,
+        };
         Self {
             strategy,
             manifest,
             instruments,
             portfolio,
-            fill_model: ConservativeCausalFillModel::default(),
+            fill_model,
             audit,
             market_state: MarketState::default(),
+            mbo_books: BTreeMap::new(),
             pending_orders: Vec::new(),
+            mbo_limit_trackers: Vec::new(),
             orders: Vec::new(),
             fills: Vec::new(),
             equity_curve: Vec::new(),
@@ -299,6 +356,7 @@ impl<S: Strategy> BacktestEngine<S> {
     }
 
     pub fn run(&mut self, mut events: Vec<MarketEvent>) -> Result<RunReport> {
+        self.validate_execution_policy()?;
         events.sort_by_key(|event| (event.timestamp_ns(), event.priority()));
         for event in &events {
             self.audit_market_event_cutoff(event)?;
@@ -306,6 +364,7 @@ impl<S: Strategy> BacktestEngine<S> {
             self.apply_marks();
             self.accrue_financing(event.timestamp_ns())?;
             self.evaluate_pending_orders(event)?;
+            self.update_mbo_book(event);
             self.dispatch_strategy_event(event)?;
             self.record_equity(event.timestamp_ns())?;
         }
@@ -358,27 +417,74 @@ impl<S: Strategy> BacktestEngine<S> {
             if order.id == 0 {
                 order.id = self.next_order_id;
                 self.next_order_id += 1;
+            } else {
+                self.next_order_id = self.next_order_id.max(order.id.saturating_add(1));
             }
             self.orders.push(order.clone());
+            if let Some(mut tracker) = MboLimitFillTracker::new(order.clone()) {
+                if let Some(book) = self.mbo_books.get(&order.instrument_id) {
+                    tracker.snapshot_queue_ahead(book);
+                }
+                self.mbo_limit_trackers.push(tracker);
+            }
             self.pending_orders.push(order);
         }
     }
 
     fn evaluate_pending_orders(&mut self, event: &MarketEvent) -> Result<()> {
-        let mut remaining = Vec::new();
         let mut fills = Vec::new();
-        for order in self.pending_orders.drain(..) {
-            let Some(spec) = self.instruments.get(&order.instrument_id) else {
-                remaining.push(order);
-                continue;
-            };
-            if let Some(fill) = self.fill_model.try_fill(&order, event, spec) {
-                fills.push(fill);
-            } else {
-                remaining.push(order);
+        let mut filled_order_ids = BTreeSet::new();
+
+        if let MarketEvent::Mbo(mbo) = event {
+            if let Some(book) = self.mbo_books.get(&mbo.instrument_id) {
+                let mut remaining_trackers = Vec::new();
+                for mut tracker in self.mbo_limit_trackers.drain(..) {
+                    if tracker.order.instrument_id != mbo.instrument_id {
+                        remaining_trackers.push(tracker);
+                        continue;
+                    }
+                    if tracker.observe(book, mbo) {
+                        let Some(spec) = self.instruments.get(&tracker.order.instrument_id) else {
+                            remaining_trackers.push(tracker);
+                            continue;
+                        };
+                        if let Some(fill) = tracker.to_fill(spec, &self.fill_model.costs) {
+                            filled_order_ids.insert(fill.order_id);
+                            fills.push(fill);
+                        }
+                    } else {
+                        remaining_trackers.push(tracker);
+                    }
+                }
+                self.mbo_limit_trackers = remaining_trackers;
             }
+        } else {
+            let mut remaining = Vec::new();
+            let active_mbo_tracked_order_ids = self.active_mbo_tracked_order_ids();
+            for order in self.pending_orders.drain(..) {
+                if active_mbo_tracked_order_ids.contains(&order.id) {
+                    remaining.push(order);
+                    continue;
+                }
+                let Some(spec) = self.instruments.get(&order.instrument_id) else {
+                    remaining.push(order);
+                    continue;
+                };
+                if let Some(fill) = self.fill_model.try_fill(&order, event, spec) {
+                    filled_order_ids.insert(fill.order_id);
+                    fills.push(fill);
+                } else {
+                    remaining.push(order);
+                }
+            }
+            self.pending_orders = remaining;
         }
-        self.pending_orders = remaining;
+        if !filled_order_ids.is_empty() {
+            self.pending_orders
+                .retain(|order| !filled_order_ids.contains(&order.id));
+            self.mbo_limit_trackers
+                .retain(|tracker| !filled_order_ids.contains(&tracker.order.id));
+        }
         let had_fills = !fills.is_empty();
         for fill in fills {
             self.apply_fill(fill)?;
@@ -387,6 +493,26 @@ impl<S: Strategy> BacktestEngine<S> {
             self.apply_marks();
         }
         Ok(())
+    }
+
+    fn active_mbo_tracked_order_ids(&self) -> BTreeSet<u64> {
+        self.mbo_limit_trackers
+            .iter()
+            .filter(|tracker| {
+                tracker.queue_ahead.is_some()
+                    || self.mbo_books.contains_key(&tracker.order.instrument_id)
+            })
+            .map(|tracker| tracker.order.id)
+            .collect()
+    }
+
+    fn update_mbo_book(&mut self, event: &MarketEvent) {
+        if let MarketEvent::Mbo(mbo) = event {
+            self.mbo_books
+                .entry(mbo.instrument_id)
+                .or_insert_with(|| BookBuilder::new(mbo.instrument_id))
+                .process_mbo(mbo);
+        }
     }
 
     fn apply_fill(&mut self, fill: Fill) -> Result<()> {
@@ -411,7 +537,24 @@ impl<S: Strategy> BacktestEngine<S> {
 
     fn audit_market_event_cutoff(&mut self, event: &MarketEvent) -> Result<()> {
         if let MarketEvent::Bar(bar) = event {
-            let cutoff = bar.feature_cutoff_ts.unwrap_or(bar.ts_close);
+            // Strict mode forbids implicit-default cutoffs: if the data
+            // pipeline doesn't say when this bar's features became causal, the
+            // audit can't catch a leak. The Warn-mode default of `ts_close` is
+            // optimistic — silent acceptance lets fictional alpha through.
+            if bar.feature_cutoff_ts.is_none() && self.audit.mode == ValidationMode::Strict {
+                self.audit
+                    .warn(
+                        Some(event.timestamp_ns()),
+                        kenoma_audit::AuditCode::FutureDataAccess,
+                        format!(
+                            "bar for instrument {} has no feature_cutoff_ts; \
+                             strict mode requires explicit cutoff",
+                            bar.instrument_id
+                        ),
+                    )
+                    .map_err(anyhow::Error::new)?;
+            }
+            let cutoff = effective_cutoff_ts(bar);
             self.audit
                 .record_feature_cutoff(
                     format!("bar_event:{}", bar.instrument_id),
@@ -432,6 +575,16 @@ impl<S: Strategy> BacktestEngine<S> {
             .find(|event| event.severity == AuditSeverity::Warning)
         {
             anyhow::bail!("{}", event.message);
+        }
+        Ok(())
+    }
+
+    fn validate_execution_policy(&self) -> Result<()> {
+        if self.manifest.execution.policy != "conservative_causal" {
+            anyhow::bail!(
+                "unsupported execution policy '{}'; supported policy is conservative_causal",
+                self.manifest.execution.policy
+            );
         }
         Ok(())
     }
@@ -500,7 +653,13 @@ impl<S: Strategy> BacktestEngine<S> {
             })
             .collect::<Vec<_>>();
         let trade_pnls = realized_trade_pnls(&self.fills, &self.instruments);
-        let metrics = compute_metrics(&stats_curve, &trade_pnls);
+        let metrics = compute_metrics_with(
+            &stats_curve,
+            &trade_pnls,
+            &MetricsConfig {
+                annualization_factor: self.manifest.metrics.annualization_factor,
+            },
+        );
         RunReport {
             run_id: self.manifest.run.id.clone(),
             metrics: RunMetrics {
@@ -509,6 +668,8 @@ impl<S: Strategy> BacktestEngine<S> {
                 total_return: metrics.total_return,
                 max_drawdown: metrics.max_drawdown,
                 sharpe: metrics.sharpe,
+                sharpe_annualization: metrics.sharpe_annualization,
+                annualized_sharpe: metrics.annualized_sharpe,
                 profit_factor: metrics.profit_factor,
                 total_fees: self.portfolio.total_fees,
                 trade_count: metrics.trade_count,
@@ -521,11 +682,29 @@ impl<S: Strategy> BacktestEngine<S> {
     }
 }
 
+/// Resolves the causal cutoff timestamp for a bar.
+///
+/// When a bar declares an explicit `feature_cutoff_ts`, that's the contract.
+/// Otherwise we fall back to `ts_close`, which is the most permissive
+/// no-leak interpretation (i.e. the bar publishes nothing post-close). In
+/// strict validation mode the engine warns separately when this fallback is
+/// used so the silent default cannot mask a missing-cutoff data bug.
+fn effective_cutoff_ts(bar: &Bar) -> TimestampNs {
+    bar.feature_cutoff_ts.unwrap_or(bar.ts_close)
+}
+
 fn realized_trade_pnls(
     fills: &[Fill],
     instruments: &BTreeMap<InstrumentId, InstrumentSpec>,
 ) -> Vec<TradePnl> {
-    let mut positions = BTreeMap::<InstrumentId, (f64, f64)>::new();
+    #[derive(Debug, Clone, Copy, Default)]
+    struct PnlPosition {
+        qty: f64,
+        avg_price: f64,
+        open_fees: f64,
+    }
+
+    let mut positions = BTreeMap::<InstrumentId, PnlPosition>::new();
     let mut trade_pnls = Vec::new();
 
     for fill in fills {
@@ -534,35 +713,52 @@ fn realized_trade_pnls(
             .map(|spec| spec.multiplier)
             .unwrap_or(1.0);
         let signed_qty = fill.qty * fill.side.sign();
-        let (qty, avg_price) = positions.entry(fill.instrument_id).or_insert((0.0, 0.0));
-        let old_qty = *qty;
-        let mut realized = 0.0;
+        let position = positions.entry(fill.instrument_id).or_default();
+        let old_qty = position.qty;
 
         if old_qty == 0.0 || old_qty.signum() == signed_qty.signum() {
             let new_qty = old_qty + signed_qty;
-            *avg_price = if new_qty == 0.0 {
+            position.avg_price = if new_qty == 0.0 {
                 0.0
             } else {
-                (old_qty.abs() * *avg_price + signed_qty.abs() * fill.price) / new_qty.abs()
+                (old_qty.abs() * position.avg_price + signed_qty.abs() * fill.price) / new_qty.abs()
             };
-            *qty = new_qty;
+            position.qty = new_qty;
+            position.open_fees += fill.fee;
         } else {
             let close_qty = old_qty.abs().min(signed_qty.abs());
-            realized = close_qty * (fill.price - *avg_price) * old_qty.signum() * multiplier;
+            let realized_price_pnl =
+                close_qty * (fill.price - position.avg_price) * old_qty.signum() * multiplier;
+            let entry_fee_alloc = if old_qty.abs() > 0.0 {
+                position.open_fees * close_qty / old_qty.abs()
+            } else {
+                0.0
+            };
+            let close_fee_alloc = if fill.qty.abs() > 0.0 {
+                fill.fee * close_qty / fill.qty.abs()
+            } else {
+                0.0
+            };
+            let pnl = realized_price_pnl - entry_fee_alloc - close_fee_alloc;
+            if close_qty > 0.0 {
+                trade_pnls.push(TradePnl { ts: fill.ts, pnl });
+            }
+
             let new_qty = old_qty + signed_qty;
-            *qty = new_qty;
-            *avg_price = if new_qty == 0.0 {
+            position.qty = new_qty;
+            position.open_fees -= entry_fee_alloc;
+            position.avg_price = if new_qty == 0.0 {
+                position.open_fees = 0.0;
                 0.0
             } else if old_qty.signum() != new_qty.signum() {
+                let opening_qty = signed_qty.abs() - close_qty;
+                let opening_fee = fill.fee - close_fee_alloc;
+                position.open_fees = opening_fee;
+                debug_assert!(opening_qty > 0.0);
                 fill.price
             } else {
-                *avg_price
+                position.avg_price
             };
-        }
-
-        let pnl = realized - fill.fee;
-        if pnl != 0.0 {
-            trade_pnls.push(TradePnl { ts: fill.ts, pnl });
         }
     }
 
@@ -646,7 +842,9 @@ impl Strategy for BuyFirstBarStrategy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kenoma_types::{AssetClass, BorrowSpec, FeeSpec, OrderSide, TimerEvent};
+    use kenoma_types::{
+        AssetClass, BorrowSpec, FeeSpec, MboEvent, OrderSide, Side, TimerEvent, Trade,
+    };
 
     fn spec() -> InstrumentSpec {
         InstrumentSpec {
@@ -684,10 +882,9 @@ mod tests {
                 crate_path: None,
                 params: BTreeMap::new(),
             },
-            execution: ExecutionConfig {
-                policy: "conservative_causal".to_string(),
-            },
+            execution: ExecutionConfig::default(),
             validation: ValidationConfig { strict: false },
+            metrics: MetricsManifestConfig::default(),
             output: OutputConfig {
                 dir: PathBuf::from("target/test-run"),
             },
@@ -756,6 +953,171 @@ mod tests {
         assert_eq!(report.fills[0].ts, 30);
     }
 
+    #[derive(Default)]
+    struct SubmitMboLimitOnce {
+        done: bool,
+    }
+
+    impl Strategy for SubmitMboLimitOnce {
+        fn on_event(&mut self, ctx: &mut StrategyContext, event: &MarketEvent) -> Result<()> {
+            if !self.done && matches!(event, MarketEvent::Mbo(_)) {
+                ctx.submit_order(OrderRequest::limit(1, OrderSide::Buy, 1.0, 100.0));
+                self.done = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn engine_uses_mbo_queue_ahead_for_limit_fills() {
+        let events = vec![
+            MarketEvent::Mbo(MboEvent::from_dbn_parts(
+                1,
+                10,
+                1,
+                'A',
+                'B',
+                100_000_000_000,
+                5,
+                kenoma_book::F_LAST,
+            )),
+            MarketEvent::Mbo(MboEvent::from_dbn_parts(
+                2,
+                11,
+                1,
+                'F',
+                'B',
+                100_000_000_000,
+                5,
+                kenoma_book::F_LAST,
+            )),
+            MarketEvent::Mbo(MboEvent::from_dbn_parts(
+                3,
+                12,
+                1,
+                'F',
+                'B',
+                100_000_000_000,
+                1,
+                kenoma_book::F_LAST,
+            )),
+        ];
+        let mut engine = BacktestEngine::new(SubmitMboLimitOnce::default(), manifest());
+        let report = engine.run(events).unwrap();
+        assert_eq!(report.orders.len(), 1);
+        assert_eq!(report.fills.len(), 1);
+        assert_eq!(report.fills[0].ts, 3);
+        assert_eq!(report.fills[0].price, 100.0);
+        assert_eq!(report.fills[0].liquidity.as_deref(), Some("maker"));
+    }
+
+    #[derive(Default)]
+    struct SubmitTimerMboLimit {
+        done: bool,
+    }
+
+    impl Strategy for SubmitTimerMboLimit {
+        fn on_timer(&mut self, ctx: &mut StrategyContext, _name: &str) -> Result<()> {
+            if !self.done {
+                ctx.submit_order(OrderRequest::limit(1, OrderSide::Buy, 1.0, 100.0));
+                self.done = true;
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn mbo_limit_submitted_before_book_still_tracks_queue() {
+        let events = vec![
+            MarketEvent::Timer(TimerEvent {
+                ts: 0,
+                name: "submit".to_string(),
+            }),
+            MarketEvent::Mbo(MboEvent::from_dbn_parts(
+                1,
+                10,
+                1,
+                'A',
+                'B',
+                100_000_000_000,
+                5,
+                kenoma_book::F_LAST,
+            )),
+            MarketEvent::Mbo(MboEvent::from_dbn_parts(
+                2,
+                11,
+                1,
+                'F',
+                'B',
+                100_000_000_000,
+                5,
+                kenoma_book::F_LAST,
+            )),
+            MarketEvent::Mbo(MboEvent::from_dbn_parts(
+                3,
+                12,
+                1,
+                'F',
+                'B',
+                100_000_000_000,
+                1,
+                kenoma_book::F_LAST,
+            )),
+        ];
+        let mut engine = BacktestEngine::new(SubmitTimerMboLimit::default(), manifest());
+        let report = engine.run(events).unwrap();
+        assert_eq!(report.orders.len(), 1);
+        assert_eq!(report.fills.len(), 1);
+        assert_eq!(report.fills[0].ts, 3);
+    }
+
+    #[test]
+    fn mbo_tracked_limit_is_not_filled_by_trade_print_before_queue_depletes() {
+        let events = vec![
+            MarketEvent::Mbo(MboEvent::from_dbn_parts(
+                1,
+                10,
+                1,
+                'A',
+                'B',
+                100_000_000_000,
+                10,
+                kenoma_book::F_LAST,
+            )),
+            MarketEvent::Trade(Trade {
+                instrument_id: 1,
+                ts: 2,
+                price: 100.0,
+                size: 1.0,
+                aggressor_side: Side::Ask,
+            }),
+            MarketEvent::Mbo(MboEvent::from_dbn_parts(
+                3,
+                11,
+                1,
+                'F',
+                'B',
+                100_000_000_000,
+                10,
+                kenoma_book::F_LAST,
+            )),
+            MarketEvent::Mbo(MboEvent::from_dbn_parts(
+                4,
+                12,
+                1,
+                'F',
+                'B',
+                100_000_000_000,
+                1,
+                kenoma_book::F_LAST,
+            )),
+        ];
+        let mut engine = BacktestEngine::new(SubmitMboLimitOnce::default(), manifest());
+        let report = engine.run(events).unwrap();
+        assert_eq!(report.fills.len(), 1);
+        assert_eq!(report.fills[0].ts, 4);
+    }
+
     #[test]
     fn fill_does_not_overwrite_current_market_mark() {
         let events = vec![
@@ -796,10 +1158,75 @@ mod tests {
                 feature_cutoff_ts: Some(30),
             }),
         ];
-        let mut engine = BacktestEngine::new(SubmitOnFirstBar::default(), manifest());
+        // Use Idealized fills so that the third bar's market fill at `open`
+        // is distinct from the bar close mark of 103 — that gap is what
+        // exercises the mark-preservation property under test.
+        let mut man = manifest();
+        man.execution.bar_fill_mode = BarFillMode::Idealized;
+        let mut engine = BacktestEngine::new(SubmitOnFirstBar::default(), man);
         let report = engine.run(events).unwrap();
         let equity_at_bar_close = report.equity_curve.last().unwrap().equity;
         assert!((equity_at_bar_close - 1000.99).abs() < 1e-9);
+    }
+
+    #[derive(Default)]
+    struct ManualThenAutoOrderId {
+        seen_quotes: usize,
+    }
+
+    impl Strategy for ManualThenAutoOrderId {
+        fn on_event(&mut self, ctx: &mut StrategyContext, event: &MarketEvent) -> Result<()> {
+            if !matches!(event, MarketEvent::Quote(_)) {
+                return Ok(());
+            }
+            self.seen_quotes += 1;
+            if self.seen_quotes == 1 {
+                let mut order = OrderRequest::market(1, OrderSide::Buy, 1.0);
+                order.id = 1;
+                ctx.submit_order(order);
+            } else if self.seen_quotes == 2 {
+                ctx.submit_order(OrderRequest::market(1, OrderSide::Buy, 1.0));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn manual_order_id_advances_generated_id_counter() {
+        let events = vec![
+            MarketEvent::Quote(Quote {
+                instrument_id: 1,
+                ts: 1,
+                bid_price: 99.0,
+                bid_size: 10.0,
+                ask_price: 100.0,
+                ask_size: 10.0,
+            }),
+            MarketEvent::Quote(Quote {
+                instrument_id: 1,
+                ts: 2,
+                bid_price: 100.0,
+                bid_size: 10.0,
+                ask_price: 101.0,
+                ask_size: 10.0,
+            }),
+            MarketEvent::Quote(Quote {
+                instrument_id: 1,
+                ts: 3,
+                bid_price: 101.0,
+                bid_size: 10.0,
+                ask_price: 102.0,
+                ask_size: 10.0,
+            }),
+        ];
+        let mut engine = BacktestEngine::new(ManualThenAutoOrderId::default(), manifest());
+        let report = engine.run(events).unwrap();
+        let order_ids = report
+            .orders
+            .iter()
+            .map(|order| order.id)
+            .collect::<Vec<_>>();
+        assert_eq!(order_ids, vec![1, 2]);
     }
 
     struct ReadBarOnTimer;
@@ -837,6 +1264,51 @@ mod tests {
         })];
         let err = engine.run(events).unwrap_err();
         assert!(err.to_string().contains("timer_bar"));
+    }
+
+    #[test]
+    fn strict_mode_rejects_bar_with_missing_feature_cutoff_ts() {
+        let events = vec![MarketEvent::Bar(Bar {
+            instrument_id: 1,
+            ts_open: 0,
+            ts_close: 10,
+            open: 100.0,
+            high: 100.0,
+            low: 100.0,
+            close: 100.0,
+            volume: 1.0,
+            vwap: None,
+            // None — strict mode must reject this.
+            feature_cutoff_ts: None,
+        })];
+        let mut strict_manifest = manifest();
+        strict_manifest.validation.strict = true;
+        let mut engine = BacktestEngine::new(NoopStrategy, strict_manifest);
+        let err = engine.run(events).unwrap_err();
+        assert!(
+            err.to_string().contains("no feature_cutoff_ts"),
+            "expected missing-cutoff diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
+    fn warn_mode_accepts_bar_with_missing_feature_cutoff_ts() {
+        // Permissive default for backwards-compat: Warn mode silently falls
+        // back to ts_close. Strict mode is the gate.
+        let events = vec![MarketEvent::Bar(Bar {
+            instrument_id: 1,
+            ts_open: 0,
+            ts_close: 10,
+            open: 100.0,
+            high: 100.0,
+            low: 100.0,
+            close: 100.0,
+            volume: 1.0,
+            vwap: None,
+            feature_cutoff_ts: None,
+        })];
+        let mut engine = BacktestEngine::new(NoopStrategy, manifest());
+        engine.run(events).unwrap();
     }
 
     #[test]
@@ -891,12 +1363,270 @@ mod tests {
     }
 
     #[test]
+    fn realized_trade_pnls_attach_entry_and_exit_fees_to_closed_trade() {
+        let mut instruments = BTreeMap::new();
+        instruments.insert(1, spec());
+        let fills = vec![
+            Fill {
+                order_id: 1,
+                instrument_id: 1,
+                ts: 1,
+                side: OrderSide::Buy,
+                price: 100.0,
+                qty: 1.0,
+                fee: 1.0,
+                liquidity: None,
+            },
+            Fill {
+                order_id: 2,
+                instrument_id: 1,
+                ts: 2,
+                side: OrderSide::Sell,
+                price: 110.0,
+                qty: 1.0,
+                fee: 1.0,
+                liquidity: None,
+            },
+        ];
+        let pnls = realized_trade_pnls(&fills, &instruments);
+        assert_eq!(pnls, vec![TradePnl { ts: 2, pnl: 8.0 }]);
+    }
+
+    #[test]
+    fn engine_realized_trade_pnls_agree_with_portfolio_minus_fees_on_round_trip() {
+        // Anti-divergence guard: the engine has TWO realized-PnL paths that
+        // must stay consistent or downstream metrics misreport. After a full
+        // round-trip back to flat:
+        //   sum(realized_trade_pnls)  ==  position.realized_pnl - position.fees
+        // Both should also equal end_equity - start_equity for a no-funding,
+        // no-borrow run with no open marks-to-market.
+        let mut futures_spec = spec();
+        futures_spec.asset_class = AssetClass::Future;
+        futures_spec.multiplier = 5.0;
+        futures_spec.tick_size = 0.25;
+        futures_spec.fees = FeeSpec {
+            commission_per_order: 1.0,
+            ..FeeSpec::default()
+        };
+        let mut man = manifest();
+        man.universe = vec![futures_spec.clone()];
+        // Idealized fills make the entry/exit prices predictable.
+        man.execution.bar_fill_mode = BarFillMode::Idealized;
+
+        #[derive(Default)]
+        struct EnterThenExitOnSecondBar {
+            entered: bool,
+            exited: bool,
+        }
+
+        impl Strategy for EnterThenExitOnSecondBar {
+            fn on_event(&mut self, ctx: &mut StrategyContext, event: &MarketEvent) -> Result<()> {
+                if let MarketEvent::Bar(_) = event {
+                    if !self.entered {
+                        ctx.submit_order(OrderRequest::market(1, OrderSide::Buy, 1.0));
+                        self.entered = true;
+                    } else if !self.exited {
+                        ctx.submit_order(OrderRequest::market(1, OrderSide::Sell, 1.0));
+                        self.exited = true;
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        let events = vec![
+            MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 0,
+                ts_close: 10,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+                volume: 10.0,
+                vwap: None,
+                feature_cutoff_ts: Some(10),
+            }),
+            MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 20,
+                ts_close: 30,
+                open: 110.0,
+                high: 110.0,
+                low: 110.0,
+                close: 110.0,
+                volume: 10.0,
+                vwap: None,
+                feature_cutoff_ts: Some(30),
+            }),
+            MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 40,
+                ts_close: 50,
+                open: 110.0,
+                high: 110.0,
+                low: 110.0,
+                close: 110.0,
+                volume: 10.0,
+                vwap: None,
+                feature_cutoff_ts: Some(50),
+            }),
+        ];
+        let mut engine = BacktestEngine::new(EnterThenExitOnSecondBar::default(), man);
+        let report = engine.run(events).unwrap();
+
+        // Two fills, position back to flat.
+        assert_eq!(report.fills.len(), 2);
+        let position = report
+            .positions
+            .iter()
+            .find(|p| p.instrument_id == 1)
+            .expect("position recorded");
+        assert_eq!(position.qty, 0.0);
+
+        let trade_pnls = realized_trade_pnls(&engine.fills, &engine.instruments);
+        let trade_pnl_sum: f64 = trade_pnls.iter().map(|t| t.pnl).sum();
+        let portfolio_minus_fees = position.realized_pnl - position.fees;
+        let equity_gain = report.metrics.end_equity - report.metrics.start_equity;
+
+        assert!(
+            (trade_pnl_sum - portfolio_minus_fees).abs() < 1e-9,
+            "engine trade PnL sum {trade_pnl_sum} disagrees with \
+             portfolio realized - fees {portfolio_minus_fees}"
+        );
+        assert!(
+            (trade_pnl_sum - equity_gain).abs() < 1e-9,
+            "engine trade PnL sum {trade_pnl_sum} disagrees with \
+             equity gain {equity_gain}"
+        );
+    }
+
+    #[test]
+    fn realized_trade_pnls_keep_zero_pnl_closed_trades_for_counts() {
+        let mut instruments = BTreeMap::new();
+        instruments.insert(1, spec());
+        let fills = vec![
+            Fill {
+                order_id: 1,
+                instrument_id: 1,
+                ts: 1,
+                side: OrderSide::Buy,
+                price: 100.0,
+                qty: 1.0,
+                fee: 0.0,
+                liquidity: None,
+            },
+            Fill {
+                order_id: 2,
+                instrument_id: 1,
+                ts: 2,
+                side: OrderSide::Sell,
+                price: 100.0,
+                qty: 1.0,
+                fee: 0.0,
+                liquidity: None,
+            },
+        ];
+        let pnls = realized_trade_pnls(&fills, &instruments);
+        assert_eq!(pnls, vec![TradePnl { ts: 2, pnl: 0.0 }]);
+    }
+
+    #[test]
     fn context_future_feature_warning_is_written() {
         let mut audit = AuditTrail::new(ValidationMode::Warn);
         let state = MarketState::default();
         let mut ctx = StrategyContext::new(10, &state, &mut audit);
         ctx.record_feature_cutoff("bad", 11).unwrap();
         assert_eq!(ctx.audit.warnings().count(), 1);
+    }
+
+    #[test]
+    fn metrics_default_to_unannualized_sharpe() {
+        // Default behavior: per-period Sharpe only; annualization is opt-in.
+        let events = vec![
+            MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 0,
+                ts_close: 10,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+                volume: 10.0,
+                vwap: None,
+                feature_cutoff_ts: Some(10),
+            }),
+            MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 10,
+                ts_close: 20,
+                open: 100.0,
+                high: 101.0,
+                low: 100.0,
+                close: 101.0,
+                volume: 10.0,
+                vwap: None,
+                feature_cutoff_ts: Some(20),
+            }),
+        ];
+        let mut engine = BacktestEngine::new(NoopStrategy, manifest());
+        let report = engine.run(events).unwrap();
+        assert!(report.metrics.sharpe_annualization.is_none());
+        assert!(report.metrics.annualized_sharpe.is_none());
+    }
+
+    #[test]
+    fn metrics_annualize_when_factor_is_set() {
+        let events = vec![
+            MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 0,
+                ts_close: 10,
+                open: 100.0,
+                high: 100.0,
+                low: 100.0,
+                close: 100.0,
+                volume: 10.0,
+                vwap: None,
+                feature_cutoff_ts: Some(10),
+            }),
+            MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 10,
+                ts_close: 20,
+                open: 100.0,
+                high: 101.0,
+                low: 100.0,
+                close: 101.0,
+                volume: 10.0,
+                vwap: None,
+                feature_cutoff_ts: Some(20),
+            }),
+            MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 20,
+                ts_close: 30,
+                open: 101.0,
+                high: 102.0,
+                low: 100.5,
+                close: 101.5,
+                volume: 10.0,
+                vwap: None,
+                feature_cutoff_ts: Some(30),
+            }),
+        ];
+        let mut man = manifest();
+        man.metrics.annualization_factor = Some(252.0);
+        let mut engine = BacktestEngine::new(NoopStrategy, man);
+        let report = engine.run(events).unwrap();
+        assert_eq!(report.metrics.sharpe_annualization, Some(252.0));
+        let annualized = report.metrics.annualized_sharpe.unwrap();
+        let expected = report.metrics.sharpe * 252.0_f64.sqrt();
+        assert!(
+            (annualized - expected).abs() < 1e-12,
+            "annualized {annualized} != per-period {} × sqrt(252)",
+            report.metrics.sharpe
+        );
     }
 
     #[test]
@@ -908,6 +1638,15 @@ mod tests {
         engine.write_artifacts().unwrap();
         assert!(dir.path().join("manifest.lock.json").is_file());
         assert!(dir.path().join("audit.json").is_file());
+    }
+
+    #[test]
+    fn unsupported_execution_policy_fails_instead_of_falling_back() {
+        let mut bad_manifest = manifest();
+        bad_manifest.execution.policy = "optimistic".to_string();
+        let mut engine = BacktestEngine::new(NoopStrategy, bad_manifest);
+        let err = engine.run(Vec::new()).unwrap_err();
+        assert!(err.to_string().contains("unsupported execution policy"));
     }
 
     #[test]
@@ -961,6 +1700,7 @@ mod tests {
         let mut manifest = manifest();
         manifest.universe = vec![borrow_spec];
         let one_day = 86_400_000_000_000;
+        let fillable_volume = 20.0;
         let events = vec![
             MarketEvent::Bar(Bar {
                 instrument_id: 1,
@@ -970,7 +1710,7 @@ mod tests {
                 high: 100.0,
                 low: 100.0,
                 close: 100.0,
-                volume: 1.0,
+                volume: fillable_volume,
                 vwap: None,
                 feature_cutoff_ts: Some(10),
             }),
@@ -982,7 +1722,7 @@ mod tests {
                 high: 100.0,
                 low: 100.0,
                 close: 100.0,
-                volume: 1.0,
+                volume: fillable_volume,
                 vwap: None,
                 feature_cutoff_ts: Some(30),
             }),
@@ -994,7 +1734,7 @@ mod tests {
                 high: 100.0,
                 low: 100.0,
                 close: 100.0,
-                volume: 1.0,
+                volume: fillable_volume,
                 vwap: None,
                 feature_cutoff_ts: Some(one_day + 30),
             }),

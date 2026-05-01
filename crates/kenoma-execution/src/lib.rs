@@ -3,7 +3,7 @@
 use kenoma_book::BookBuilder;
 use kenoma_types::{
     price_to_fixed, Bar, Fill, InstrumentSpec, MarketEvent, MboAction, MboEvent, OrderRequest,
-    OrderSide, OrderType, Price, Quantity, Quote, Side, TimestampNs,
+    OrderSide, OrderType, Price, Quantity, Quote, Side, TimestampNs, Trade,
 };
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +32,43 @@ impl Default for SpreadModel {
     }
 }
 
+/// How bar-only feeds fill market, stop, and limit orders.
+///
+/// Bar feeds carry only OHLCV — they cannot tell us where in the bar a print
+/// happened, only the boundary set. Three settlement conventions trade off
+/// realism vs. permissiveness:
+///
+/// - [`BarFillMode::Idealized`]: market at `open ± half_spread`; limits at
+///   `limit_price` whenever `bar.low ≤ limit` (buy) / `bar.high ≥ limit`
+///   (sell). This is the **trap class** that produced the es-sr-canvas
+///   Sharpe +4.00 → −2.12 collapse: a wick that touched the level but never
+///   traded through it would still fill. Opt-in only.
+/// - [`BarFillMode::WorstCase`] (default): market and stop fills land at the
+///   *worst* tick of the bar (high+half_spread for buys, low−half_spread for
+///   sells; stops at `max(open, stop, high)` for buys); limits still fill on
+///   touch at `limit_price`. Implements the user's standard "realistic-fill"
+///   no-lookahead bound for market orders.
+/// - [`BarFillMode::PrintThroughLimit`]: limit fills require strict print-
+///   through (bar.low < limit_price for buys, by at least half a tick) — wick
+///   touches that did not actually trade through the level do **not** fill.
+///   Market and stop fills are worst-of-bar (same as `WorstCase`).
+///
+/// **The default is `WorstCase`.** Idealized is opt-in because it produces
+/// fictional alpha in any strategy that detects level-touches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BarFillMode {
+    Idealized,
+    WorstCase,
+    PrintThroughLimit,
+}
+
+impl Default for BarFillMode {
+    fn default() -> Self {
+        Self::WorstCase
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionCosts {
     #[serde(default)]
@@ -42,6 +79,8 @@ pub struct ExecutionCosts {
     pub fixed_spread_ticks: f64,
     #[serde(default)]
     pub slippage_ticks: f64,
+    #[serde(default)]
+    pub bar_fill_mode: BarFillMode,
 }
 
 impl Default for ExecutionCosts {
@@ -51,6 +90,7 @@ impl Default for ExecutionCosts {
             spread_model: SpreadModel::Fixed,
             fixed_spread_ticks: 1.0,
             slippage_ticks: 0.0,
+            bar_fill_mode: BarFillMode::default(),
         }
     }
 }
@@ -124,7 +164,7 @@ impl ConservativeCausalFillModel {
         match event {
             MarketEvent::Quote(quote) => self.try_fill_quote(order, quote, spec),
             MarketEvent::Bar(bar) => self.try_fill_bar(order, bar, spec),
-            MarketEvent::Trade(trade) => self.try_fill_trade(order, trade.ts, trade.price, spec),
+            MarketEvent::Trade(trade) => self.try_fill_trade(order, trade, spec),
             _ => None,
         }
     }
@@ -135,18 +175,22 @@ impl ConservativeCausalFillModel {
         quote: &Quote,
         spec: &InstrumentSpec,
     ) -> Option<Fill> {
+        let available_qty = match order.side {
+            OrderSide::Buy => quote.ask_size,
+            OrderSide::Sell => quote.bid_size,
+        };
+        if !has_sufficient_qty(available_qty, order.qty) {
+            return None;
+        }
+
         let fill_price = match order.order_type {
             OrderType::Market => match order.side {
                 OrderSide::Buy => quote.ask_price,
                 OrderSide::Sell => quote.bid_price,
             },
             OrderType::Limit { limit_price } => match order.side {
-                OrderSide::Buy if quote.ask_price <= limit_price => {
-                    limit_price.min(quote.ask_price)
-                }
-                OrderSide::Sell if quote.bid_price >= limit_price => {
-                    limit_price.max(quote.bid_price)
-                }
+                OrderSide::Buy if quote.ask_price <= limit_price => limit_price,
+                OrderSide::Sell if quote.bid_price >= limit_price => limit_price,
                 _ => return None,
             },
             OrderType::Stop { stop_price } => match order.side {
@@ -178,20 +222,64 @@ impl ConservativeCausalFillModel {
         if order.created_ts >= bar.ts_open {
             return None;
         }
+        // NOTE: `bar.volume` is the WHOLE-BAR cumulative volume, not the size
+        // available at the bar's open print or at any specific level inside the
+        // bar. Treating it as a fill-size gate is a coarse upper bound, not a
+        // realistic liquidity check. For deploy decisions that depend on
+        // executable size at specific prices, validate against MBO/L2 — see the
+        // user's `validate_limit_fills_against_mbo` procedure.
+        if !has_sufficient_qty(bar.volume, order.qty) {
+            return None;
+        }
         let spread = self.costs.fixed_spread_ticks * spec.tick_size;
+        let mode = self.costs.bar_fill_mode;
         let fill_price = match order.order_type {
-            OrderType::Market => match order.side {
-                OrderSide::Buy => bar.open + spread / 2.0,
-                OrderSide::Sell => bar.open - spread / 2.0,
+            OrderType::Market => match (mode, order.side) {
+                (BarFillMode::Idealized, OrderSide::Buy) => bar.open + spread / 2.0,
+                (BarFillMode::Idealized, OrderSide::Sell) => bar.open - spread / 2.0,
+                (_, OrderSide::Buy) => bar.high + spread / 2.0,
+                (_, OrderSide::Sell) => bar.low - spread / 2.0,
             },
-            OrderType::Limit { limit_price } => match order.side {
-                OrderSide::Buy if bar.low <= limit_price => limit_price,
-                OrderSide::Sell if bar.high >= limit_price => limit_price,
-                _ => return None,
-            },
-            OrderType::Stop { stop_price } => match order.side {
-                OrderSide::Buy if bar.high >= stop_price => bar.open.max(stop_price) + spread / 2.0,
-                OrderSide::Sell if bar.low <= stop_price => bar.open.min(stop_price) - spread / 2.0,
+            OrderType::Limit { limit_price } => {
+                let touched = match order.side {
+                    OrderSide::Buy => bar.low <= limit_price,
+                    OrderSide::Sell => bar.high >= limit_price,
+                };
+                if !touched {
+                    return None;
+                }
+                if mode == BarFillMode::PrintThroughLimit {
+                    // Require the bar to have actually traded THROUGH the level,
+                    // not just wicked it. A bar whose low equals (or is within
+                    // half a tick of) the limit price likely never executed
+                    // there in reality. Half-tick tolerance absorbs f64 noise.
+                    let half_tick = (spec.tick_size * 0.5).max(1e-12);
+                    let printed_through = match order.side {
+                        OrderSide::Buy => bar.low < limit_price - half_tick,
+                        OrderSide::Sell => bar.high > limit_price + half_tick,
+                    };
+                    if !printed_through {
+                        return None;
+                    }
+                }
+                limit_price
+            }
+            OrderType::Stop { stop_price } => match (mode, order.side) {
+                (BarFillMode::Idealized, OrderSide::Buy) if bar.high >= stop_price => {
+                    bar.open.max(stop_price) + spread / 2.0
+                }
+                (BarFillMode::Idealized, OrderSide::Sell) if bar.low <= stop_price => {
+                    bar.open.min(stop_price) - spread / 2.0
+                }
+                (_, OrderSide::Buy) if bar.high >= stop_price => {
+                    // Worst-of-bar for a buy stop: max of (open, stop, high).
+                    // The stop's been triggered; under no-lookahead we assume
+                    // the worst tick reachable from trigger to bar close.
+                    bar.open.max(stop_price).max(bar.high) + spread / 2.0
+                }
+                (_, OrderSide::Sell) if bar.low <= stop_price => {
+                    bar.open.min(stop_price).min(bar.low) - spread / 2.0
+                }
                 _ => return None,
             },
             OrderType::StopLimit {
@@ -209,36 +297,33 @@ impl ConservativeCausalFillModel {
     fn try_fill_trade(
         &self,
         order: &OrderRequest,
-        ts: TimestampNs,
-        trade_price: Price,
+        trade: &Trade,
         spec: &InstrumentSpec,
     ) -> Option<Fill> {
-        let fill_price = match order.order_type {
+        if !has_sufficient_qty(trade.size, order.qty) {
+            return None;
+        }
+        let trade_price = trade.price;
+        let consumes_resting_order = trade.aggressor_side == order.side.consuming_book_side();
+        let (fill_price, taker) = match order.order_type {
             OrderType::Market => return None,
             OrderType::Limit { limit_price } => match order.side {
-                OrderSide::Buy if trade_price <= limit_price => limit_price,
-                OrderSide::Sell if trade_price >= limit_price => limit_price,
+                OrderSide::Buy if consumes_resting_order && trade_price <= limit_price => {
+                    (limit_price, false)
+                }
+                OrderSide::Sell if consumes_resting_order && trade_price >= limit_price => {
+                    (limit_price, false)
+                }
                 _ => return None,
             },
             OrderType::Stop { stop_price } => match order.side {
-                OrderSide::Buy if trade_price >= stop_price => trade_price.max(stop_price),
-                OrderSide::Sell if trade_price <= stop_price => trade_price.min(stop_price),
+                OrderSide::Buy if trade_price >= stop_price => (trade_price.max(stop_price), true),
+                OrderSide::Sell if trade_price <= stop_price => (trade_price.min(stop_price), true),
                 _ => return None,
             },
-            OrderType::StopLimit {
-                stop_price,
-                limit_price,
-            } => match order.side {
-                OrderSide::Buy if trade_price >= stop_price && trade_price <= limit_price => {
-                    limit_price
-                }
-                OrderSide::Sell if trade_price <= stop_price && trade_price >= limit_price => {
-                    limit_price
-                }
-                _ => return None,
-            },
+            OrderType::StopLimit { .. } => return None,
         };
-        self.fill(order, ts, fill_price, spec, true)
+        self.fill(order, trade.ts, fill_price, spec, taker)
     }
 
     fn fill(
@@ -264,6 +349,18 @@ impl ConservativeCausalFillModel {
             liquidity: Some(if taker { "taker" } else { "maker" }.to_string()),
         })
     }
+}
+
+fn has_sufficient_qty(available_qty: Quantity, requested_qty: Quantity) -> bool {
+    if !available_qty.is_finite() || !requested_qty.is_finite() || requested_qty <= 0.0 {
+        return false;
+    }
+    // Relative tolerance — `f64::EPSILON` (~2.2e-16) is meaningless for any
+    // size ≥ 1. Use `1e-9 × requested_qty` so the slack scales with magnitude
+    // and matches the f64 precision actually achievable from typical fill-
+    // arithmetic round-trips.
+    let tol = (requested_qty.abs() * 1e-9).max(1e-12);
+    available_qty + tol >= requested_qty.abs()
 }
 
 fn conservative_tick_price(spec: &InstrumentSpec, side: OrderSide, price: Price) -> Price {
@@ -374,11 +471,17 @@ impl MboLimitFillTracker {
         let consumes_same_level = event.price_fixed == self.limit_price_fixed
             && event.action == MboAction::Fill
             && event.side == self.resting_side;
-        let swept_through = match self.resting_side {
+        let swept_price = match self.resting_side {
             Side::Bid => event.price_fixed < self.limit_price_fixed,
             Side::Ask => event.price_fixed > self.limit_price_fixed,
             Side::None => false,
-        } && matches!(event.action, MboAction::Fill | MboAction::Trade);
+        };
+        let swept_through = swept_price
+            && match event.action {
+                MboAction::Fill => event.side == self.resting_side,
+                MboAction::Trade => event.side == self.order.side.consuming_book_side(),
+                _ => false,
+            };
 
         if consumes_same_level {
             self.cumulative_consuming_flow = self
@@ -472,7 +575,7 @@ mod tests {
     #[test]
     fn market_order_fills_next_quote_at_ask() {
         let fill_model = ConservativeCausalFillModel::default();
-        let mut order = OrderRequest::market(1, OrderSide::Buy, 2.0);
+        let mut order = OrderRequest::market(1, OrderSide::Buy, 1.0);
         order.id = 7;
         order.created_ts = 100;
         let event = MarketEvent::Quote(Quote {
@@ -533,6 +636,39 @@ mod tests {
             ask_size: 1.0,
         });
         assert!(fill_model.try_fill(&order, &event, &spec()).is_none());
+    }
+
+    #[test]
+    fn quote_fill_requires_displayed_size_for_full_fill() {
+        let fill_model = ConservativeCausalFillModel::default();
+        let mut order = OrderRequest::market(1, OrderSide::Buy, 2.0);
+        order.created_ts = 100;
+        let event = MarketEvent::Quote(Quote {
+            instrument_id: 1,
+            ts: 101,
+            bid_price: 9.9,
+            bid_size: 10.0,
+            ask_price: 10.1,
+            ask_size: 1.0,
+        });
+        assert!(fill_model.try_fill(&order, &event, &spec()).is_none());
+    }
+
+    #[test]
+    fn quote_limit_fill_does_not_improve_beyond_limit_price() {
+        let fill_model = ConservativeCausalFillModel::default();
+        let mut order = OrderRequest::limit(1, OrderSide::Buy, 1.0, 10.25);
+        order.created_ts = 100;
+        let event = MarketEvent::Quote(Quote {
+            instrument_id: 1,
+            ts: 101,
+            bid_price: 9.75,
+            bid_size: 1.0,
+            ask_price: 10.0,
+            ask_size: 1.0,
+        });
+        let fill = fill_model.try_fill(&order, &event, &spec()).unwrap();
+        assert_eq!(fill.price, 10.25);
     }
 
     #[test]
@@ -604,6 +740,61 @@ mod tests {
     }
 
     #[test]
+    fn resting_buy_limit_requires_sell_aggressor_trade() {
+        let fill_model = ConservativeCausalFillModel::default();
+        let mut order = OrderRequest::limit(1, OrderSide::Buy, 1.0, 100.0);
+        order.created_ts = 1;
+        let buy_aggressor = MarketEvent::Trade(Trade {
+            instrument_id: 1,
+            ts: 2,
+            price: 100.0,
+            size: 1.0,
+            aggressor_side: Side::Bid,
+        });
+        assert!(fill_model
+            .try_fill(&order, &buy_aggressor, &spec())
+            .is_none());
+
+        let sell_aggressor = MarketEvent::Trade(Trade {
+            instrument_id: 1,
+            ts: 3,
+            price: 100.0,
+            size: 1.0,
+            aggressor_side: Side::Ask,
+        });
+        let fill = fill_model
+            .try_fill(&order, &sell_aggressor, &spec())
+            .unwrap();
+        assert_eq!(fill.price, 100.0);
+    }
+
+    #[test]
+    fn resting_limit_trade_fill_uses_maker_fee() {
+        let fill_model = ConservativeCausalFillModel::default();
+        let spec = InstrumentSpec {
+            fees: FeeSpec {
+                maker_bps: 1.0,
+                taker_bps: 10.0,
+                ..FeeSpec::default()
+            },
+            ..spec()
+        };
+        let mut order = OrderRequest::limit(1, OrderSide::Buy, 1.0, 100.0);
+        order.id = 5;
+        order.created_ts = 1;
+        let sell_aggressor = MarketEvent::Trade(Trade {
+            instrument_id: 1,
+            ts: 2,
+            price: 100.0,
+            size: 1.0,
+            aggressor_side: Side::Ask,
+        });
+        let fill = fill_model.try_fill(&order, &sell_aggressor, &spec).unwrap();
+        assert_eq!(fill.liquidity.as_deref(), Some("maker"));
+        assert!((fill.fee - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
     fn buy_stop_gap_fills_at_trade_price_not_stop_price() {
         let fill_model = ConservativeCausalFillModel::default();
         let mut order = OrderRequest::market(1, OrderSide::Buy, 1.0);
@@ -621,8 +812,59 @@ mod tests {
     }
 
     #[test]
-    fn buy_stop_gap_on_bar_fills_at_open_or_worse() {
+    fn stop_limit_does_not_fill_on_triggering_trade_print() {
         let fill_model = ConservativeCausalFillModel::default();
+        let mut order = OrderRequest::market(1, OrderSide::Buy, 1.0);
+        order.order_type = OrderType::StopLimit {
+            stop_price: 100.0,
+            limit_price: 101.0,
+        };
+        order.created_ts = 1;
+        let event = MarketEvent::Trade(Trade {
+            instrument_id: 1,
+            ts: 2,
+            price: 100.5,
+            size: 1.0,
+            aggressor_side: Side::Ask,
+        });
+        assert!(fill_model.try_fill(&order, &event, &spec()).is_none());
+    }
+
+    #[test]
+    fn buy_stop_gap_on_bar_fills_at_open_or_worse() {
+        // Default mode (WorstCase) fills at the worst tick reachable inside the
+        // bar after the stop triggers: max(open, stop, high) + half-spread.
+        let fill_model = ConservativeCausalFillModel::default();
+        let mut order = OrderRequest::market(1, OrderSide::Buy, 1.0);
+        order.order_type = OrderType::Stop { stop_price: 100.0 };
+        order.created_ts = 1;
+        let event = MarketEvent::Bar(Bar {
+            instrument_id: 1,
+            ts_open: 2,
+            ts_close: 3,
+            open: 120.0,
+            high: 121.0,
+            low: 119.0,
+            close: 120.0,
+            volume: 1.0,
+            vwap: None,
+            feature_cutoff_ts: None,
+        });
+        let fill = fill_model.try_fill(&order, &event, &spec()).unwrap();
+        // 121.0 (worst) + half of one-tick spread (0.125) → 121.125 → ceil to
+        // tick → 121.25.
+        assert_eq!(fill.price, 121.25);
+    }
+
+    #[test]
+    fn buy_stop_idealized_mode_preserves_open_fill() {
+        let fill_model = ConservativeCausalFillModel {
+            policy: FillPolicy::ConservativeCausal,
+            costs: ExecutionCosts {
+                bar_fill_mode: BarFillMode::Idealized,
+                ..ExecutionCosts::default()
+            },
+        };
         let mut order = OrderRequest::market(1, OrderSide::Buy, 1.0);
         order.order_type = OrderType::Stop { stop_price: 100.0 };
         order.created_ts = 1;
@@ -664,6 +906,133 @@ mod tests {
             feature_cutoff_ts: None,
         });
         assert!(fill_model.try_fill(&order, &event, &spec()).is_none());
+    }
+
+    fn bar_with_volume(open: Price, high: Price, low: Price, close: Price) -> Bar {
+        Bar {
+            instrument_id: 1,
+            ts_open: 2,
+            ts_close: 3,
+            open,
+            high,
+            low,
+            close,
+            volume: 100.0,
+            vwap: None,
+            feature_cutoff_ts: None,
+        }
+    }
+
+    fn fill_model_with_mode(mode: BarFillMode) -> ConservativeCausalFillModel {
+        ConservativeCausalFillModel {
+            policy: FillPolicy::ConservativeCausal,
+            costs: ExecutionCosts {
+                bar_fill_mode: mode,
+                ..ExecutionCosts::default()
+            },
+        }
+    }
+
+    #[test]
+    fn worst_case_mode_fills_buy_market_at_bar_high_plus_half_spread() {
+        let model = fill_model_with_mode(BarFillMode::WorstCase);
+        let mut order = OrderRequest::market(1, OrderSide::Buy, 1.0);
+        order.created_ts = 1;
+        let event = MarketEvent::Bar(bar_with_volume(100.0, 110.0, 99.0, 105.0));
+        let fill = model.try_fill(&order, &event, &spec()).unwrap();
+        // 110.0 + 0.125 (half a tick) → ceil to tick → 110.25.
+        assert_eq!(fill.price, 110.25);
+    }
+
+    #[test]
+    fn worst_case_mode_fills_sell_market_at_bar_low_minus_half_spread() {
+        let model = fill_model_with_mode(BarFillMode::WorstCase);
+        let mut order = OrderRequest::market(1, OrderSide::Sell, 1.0);
+        order.created_ts = 1;
+        let event = MarketEvent::Bar(bar_with_volume(100.0, 110.0, 99.0, 105.0));
+        let fill = model.try_fill(&order, &event, &spec()).unwrap();
+        // 99.0 - 0.125 → floor to tick → 98.75.
+        assert_eq!(fill.price, 98.75);
+    }
+
+    #[test]
+    fn idealized_mode_fills_market_at_open_for_back_compat() {
+        let model = fill_model_with_mode(BarFillMode::Idealized);
+        let mut order = OrderRequest::market(1, OrderSide::Buy, 1.0);
+        order.created_ts = 1;
+        let event = MarketEvent::Bar(bar_with_volume(100.0, 110.0, 99.0, 105.0));
+        let fill = model.try_fill(&order, &event, &spec()).unwrap();
+        // 100.0 + 0.125 → 100.125 → ceil to tick → 100.25.
+        assert_eq!(fill.price, 100.25);
+    }
+
+    #[test]
+    fn worst_case_mode_still_fills_limit_on_touch() {
+        // WorstCase only changes market/stop semantics; limits keep touch-based
+        // semantics so retest-style strategies remain testable. To require
+        // print-through, use BarFillMode::PrintThroughLimit.
+        let model = fill_model_with_mode(BarFillMode::WorstCase);
+        let mut order = OrderRequest::limit(1, OrderSide::Buy, 1.0, 100.0);
+        order.created_ts = 1;
+        // bar.low touches the limit exactly.
+        let event = MarketEvent::Bar(bar_with_volume(101.0, 102.0, 100.0, 101.5));
+        let fill = model.try_fill(&order, &event, &spec()).unwrap();
+        assert_eq!(fill.price, 100.0);
+    }
+
+    #[test]
+    fn print_through_limit_rejects_wick_touch() {
+        // bar.low equals limit_price — under PrintThroughLimit, this is a wick
+        // touch that did not actually trade through, so no fill. Under
+        // WorstCase or Idealized, this would fill.
+        let pt = fill_model_with_mode(BarFillMode::PrintThroughLimit);
+        let wc = fill_model_with_mode(BarFillMode::WorstCase);
+        let id = fill_model_with_mode(BarFillMode::Idealized);
+        let mut order = OrderRequest::limit(1, OrderSide::Buy, 1.0, 100.0);
+        order.created_ts = 1;
+        let event = MarketEvent::Bar(bar_with_volume(101.0, 102.0, 100.0, 101.5));
+        assert!(pt.try_fill(&order, &event, &spec()).is_none());
+        assert!(wc.try_fill(&order, &event, &spec()).is_some());
+        assert!(id.try_fill(&order, &event, &spec()).is_some());
+    }
+
+    #[test]
+    fn print_through_limit_fills_when_bar_actually_trades_through() {
+        let pt = fill_model_with_mode(BarFillMode::PrintThroughLimit);
+        let mut order = OrderRequest::limit(1, OrderSide::Buy, 1.0, 100.0);
+        order.created_ts = 1;
+        // bar.low strictly below limit by more than half a tick.
+        let event = MarketEvent::Bar(bar_with_volume(101.0, 102.0, 99.5, 101.5));
+        let fill = pt.try_fill(&order, &event, &spec()).unwrap();
+        assert_eq!(fill.price, 100.0);
+    }
+
+    #[test]
+    fn print_through_limit_sell_side_symmetry() {
+        let pt = fill_model_with_mode(BarFillMode::PrintThroughLimit);
+        let mut order = OrderRequest::limit(1, OrderSide::Sell, 1.0, 100.0);
+        order.created_ts = 1;
+        // wick-touch on the high side: high == limit, no print-through.
+        let wick = MarketEvent::Bar(bar_with_volume(99.0, 100.0, 98.0, 99.5));
+        assert!(pt.try_fill(&order, &wick, &spec()).is_none());
+        // genuine print-through: high strictly above limit.
+        let through = MarketEvent::Bar(bar_with_volume(99.0, 100.5, 98.0, 99.5));
+        let fill = pt.try_fill(&order, &through, &spec()).unwrap();
+        assert_eq!(fill.price, 100.0);
+    }
+
+    #[test]
+    fn worst_case_mode_buy_stop_fills_above_stop_when_high_is_above() {
+        let model = fill_model_with_mode(BarFillMode::WorstCase);
+        let mut order = OrderRequest::market(1, OrderSide::Buy, 1.0);
+        order.order_type = OrderType::Stop { stop_price: 100.0 };
+        order.created_ts = 1;
+        // open below stop, high gaps through it. Idealized fills at
+        // max(open, stop) = stop = 100.25 (after rounding); WorstCase fills at
+        // max(open, stop, high) = 105 + half-spread = 105.25.
+        let event = MarketEvent::Bar(bar_with_volume(99.0, 105.0, 98.0, 102.0));
+        let fill = model.try_fill(&order, &event, &spec()).unwrap();
+        assert_eq!(fill.price, 105.25);
     }
 
     #[test]
@@ -747,5 +1116,22 @@ mod tests {
             .to_fill(&spec(), &ExecutionCosts::default())
             .unwrap();
         assert_eq!(fill.qty, 5.0);
+    }
+
+    #[test]
+    fn mbo_swept_through_requires_consuming_side() {
+        let builder = BookBuilder::new(1);
+        let mut order = OrderRequest::limit(1, OrderSide::Buy, 1.0, 100.0);
+        order.id = 99;
+        order.created_ts = 1;
+        let mut tracker = MboLimitFillTracker::new(order).unwrap();
+        tracker.snapshot_queue_ahead(&builder);
+
+        let wrong_side_trade = MboEvent::from_dbn_parts(2, 10, 1, 'T', 'B', 99_000_000_000, 1, 0);
+        assert!(!tracker.observe(&builder, &wrong_side_trade));
+
+        let sell_aggressor_trade =
+            MboEvent::from_dbn_parts(3, 11, 1, 'T', 'A', 99_000_000_000, 1, 0);
+        assert!(tracker.observe(&builder, &sell_aggressor_trade));
     }
 }

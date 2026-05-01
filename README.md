@@ -5,12 +5,36 @@ Standalone Rust research backtester for Kenoma pods.
 V1 provides:
 
 - A timestamp-ordered event clock for bars, quotes, trades, MBO, timers, orders, fills, and marks.
-- Typed `Strategy` API with `StrategyContext` causal feature cutoff auditing.
+- Typed `Strategy` API with `StrategyContext` causal feature cutoff auditing. Strict mode rejects bars without an explicit `feature_cutoff_ts`.
 - Conservative causal fills by default: no same-event market fills, quote and strictly-after-open bar execution, pessimistic bar bracket ambiguity, and MBO queue-ahead limit validation.
+- Configurable bar-fill price model (default **worst_case**) so that bar-only feeds do not silently report fills at prices the bar never traded at — see [Bar fill modes](#bar-fill-modes).
 - Multi-asset instrument metadata and portfolio accounting for equities, crypto spot/perps, futures, options, FX, fees, borrow, and funding.
 - Built-in Black-Scholes-Merton, Black-76, CRR binomial, Greeks, and IV solver.
 - DBN MBO ingest support behind the `kenoma-data/dbn` feature.
 - Reproducible TOML manifests and structured run artifacts.
+
+## Bar fill modes
+
+Bar feeds carry only OHLCV — they do not say where in the bar a print
+happened, only the boundary set. `[execution].bar_fill_mode` selects the
+settlement convention:
+
+| Mode | Market | Stop | Limit (touch) |
+| --- | --- | --- | --- |
+| `idealized` | `open ± half_spread` | `max(open, stop) ± half_spread` | fills at `limit_price` when bar wicks the level |
+| `worst_case` (default) | `high + half_spread` (buy) / `low - half_spread` (sell) | `max(open, stop, high) + half_spread` (buy) / symmetric | fills on touch at `limit_price` |
+| `print_through_limit` | same as `worst_case` | same as `worst_case` | requires bar to print *through* the level (low strictly below limit by ≥ ½ tick) before filling |
+
+`idealized` is the trap class identified in
+`~/LOCAL_DEV/CLAUDE.md` (the es-sr-canvas Sharpe +4.00 → −2.12 collapse came
+from idealized bar-limit fills). It is opt-in only. **For deploy decisions,
+do not trust idealized numbers without re-validating under at least
+`worst_case` for market/stop fills and `print_through_limit` for any
+strategy whose entry depends on level-touch.**
+
+The bar-fill price model is **only a coarse proxy** for execution realism on
+sparse OHLCV. Validate any fill-sensitive strategy against MBO/L2 (see
+`validate_limit_fills_against_mbo`) before allocating capital.
 
 ## CLI
 

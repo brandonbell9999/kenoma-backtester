@@ -928,6 +928,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "kenoma-audit",
+ "kenoma-book",
  "kenoma-data",
  "kenoma-execution",
  "kenoma-portfolio",

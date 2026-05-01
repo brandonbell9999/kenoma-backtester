@@ -27,9 +27,19 @@ qty = 10.0
 
 [execution]
 policy = "conservative_causal"
+# Default is "worst_case". Set to "idealized" to reproduce legacy
+# open-fill behavior, or "print_through_limit" for level-touch
+# selection-bias testing.
+bar_fill_mode = "worst_case"
 
 [validation]
 strict = false
+
+[metrics]
+# Number of equity-curve return periods per year. Leave commented out for
+# unannualized Sharpe (the default). Set explicitly for the equity curve's
+# sampling frequency, e.g. 252 for daily, 252*6.5*60 for 1-min RTH bars.
+# annualization_factor = 252.0
 
 [output]
 dir = "target/kenoma-runs/bar-smoke"
