@@ -24,6 +24,9 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
+mod resolvers;
+pub use resolvers::{AlwaysRth, RolloverResolver, SessionResolver, StaticContract};
+
 pub trait Strategy {
     fn on_event(&mut self, _ctx: &mut StrategyContext, _event: &MarketEvent) -> Result<()> {
         Ok(())
