@@ -16,7 +16,7 @@ use kenoma_stats::{
 };
 use kenoma_types::{
     Bar, EquityPoint, Fill, InstrumentId, InstrumentSpec, MarketEvent, OrderRequest, Price, Quote,
-    RunMetrics, RunReport, TimestampNs,
+    RunMetrics, RunReport, SessionPhase, TimestampNs,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,6 +37,42 @@ pub trait Strategy {
     }
 
     fn on_fill(&mut self, _ctx: &mut StrategyContext, _fill: &Fill) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fired by the engine when the resolved session phase changes for an
+    /// instrument, AFTER `on_event`/`on_timer` for the current event has
+    /// returned and any orders it submitted have been drained.
+    ///
+    /// Only fired when `ExecutionConfig.enable_hg_hooks == true`. Default
+    /// impl is a no-op so existing strategies need not override.
+    fn on_session_boundary(
+        &mut self,
+        _ctx: &mut StrategyContext,
+        _instrument_id: InstrumentId,
+        _new_phase: SessionPhase,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fired by the engine when the resolved active contract changes for an
+    /// instrument family, AFTER `on_event`/`on_timer` for the current event
+    /// has returned and any orders it submitted have been drained.
+    ///
+    /// The engine queues a force-flat market order with
+    /// `reason="ROLLOVER_BOUNDARY"` for any open position on `old_contract`
+    /// AFTER this method returns and its orders are drained -- the strategy's
+    /// own flattening (if any) goes first, the engine's safety net second.
+    ///
+    /// Only fired when `ExecutionConfig.enable_hg_hooks == true`. Default
+    /// impl is a no-op.
+    fn on_rollover_boundary(
+        &mut self,
+        _ctx: &mut StrategyContext,
+        _instrument_family: &str,
+        _old_contract: &str,
+        _new_contract: &str,
+    ) -> Result<()> {
         Ok(())
     }
 
