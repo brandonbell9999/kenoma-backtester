@@ -357,6 +357,13 @@ pub struct BacktestEngine<S> {
     last_borrow_ts: BTreeMap<InstrumentId, TimestampNs>,
     last_funding_ts: BTreeMap<InstrumentId, TimestampNs>,
     next_order_id: u64,
+    session_resolver: Box<dyn SessionResolver>,
+    rollover_resolver: Box<dyn RolloverResolver>,
+    // Read by dispatch_session_boundary / dispatch_rollover_boundary (Task 8–9).
+    #[allow(dead_code)]
+    last_session_phase: BTreeMap<InstrumentId, SessionPhase>,
+    #[allow(dead_code)]
+    last_active_contract: BTreeMap<String, String>,
 }
 
 impl<S: Strategy> BacktestEngine<S> {
@@ -399,7 +406,21 @@ impl<S: Strategy> BacktestEngine<S> {
             last_borrow_ts: BTreeMap::new(),
             last_funding_ts: BTreeMap::new(),
             next_order_id: 1,
+            session_resolver: Box::new(AlwaysRth),
+            rollover_resolver: Box::new(StaticContract::new("__static__")),
+            last_session_phase: BTreeMap::new(),
+            last_active_contract: BTreeMap::new(),
         }
+    }
+
+    pub fn with_session_resolver(mut self, resolver: Box<dyn SessionResolver>) -> Self {
+        self.session_resolver = resolver;
+        self
+    }
+
+    pub fn with_rollover_resolver(mut self, resolver: Box<dyn RolloverResolver>) -> Self {
+        self.rollover_resolver = resolver;
+        self
     }
 
     pub fn run_manifest(strategy: S, manifest: RunManifest) -> Result<(RunReport, AuditTrail)> {
