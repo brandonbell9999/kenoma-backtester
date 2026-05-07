@@ -223,6 +223,22 @@ impl MboAction {
     }
 }
 
+/// Trading session phase resolved by a `SessionResolver` in `kenoma-engine`.
+///
+/// `Rth` is regular trading hours, `Eth` is extended trading hours,
+/// `Halt` is a market-wide or instrument-level halt. The harness's
+/// session-aware behaviour fires `Strategy::on_session_boundary` when
+/// the resolved phase changes between successive events for the same
+/// instrument. The default resolver `AlwaysRth` returns `Rth` unconditionally,
+/// so existing kenoma-backtester consumers never observe a transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPhase {
+    Rth,
+    Eth,
+    Halt,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Bar {
     pub instrument_id: InstrumentId,
