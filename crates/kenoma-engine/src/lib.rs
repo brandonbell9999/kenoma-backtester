@@ -359,9 +359,8 @@ pub struct BacktestEngine<S> {
     next_order_id: u64,
     session_resolver: Box<dyn SessionResolver>,
     rollover_resolver: Box<dyn RolloverResolver>,
-    // Read by dispatch_session_boundary / dispatch_rollover_boundary (Task 8–9).
-    #[allow(dead_code)]
     last_session_phase: BTreeMap<InstrumentId, SessionPhase>,
+    // Read by dispatch_rollover_boundary (Task 9).
     #[allow(dead_code)]
     last_active_contract: BTreeMap<String, String>,
 }
@@ -484,6 +483,40 @@ impl<S: Strategy> BacktestEngine<S> {
         };
         self.fail_on_new_strict_warnings(audit_events_before)?;
         self.accept_context_orders(new_orders);
+
+        if self.manifest.execution.enable_hg_hooks {
+            self.dispatch_session_boundary(event)?;
+            self.dispatch_rollover_boundary(event)?;
+        }
+
+        Ok(())
+    }
+
+    fn dispatch_session_boundary(&mut self, event: &MarketEvent) -> Result<()> {
+        let Some(instrument_id) = event.instrument_id() else {
+            return Ok(());
+        };
+        let ts_ns = event.timestamp_ns();
+        let new_phase = self.session_resolver.session_phase(ts_ns, instrument_id);
+        let prior = self.last_session_phase.get(&instrument_id).copied();
+        if prior == Some(new_phase) {
+            return Ok(());
+        }
+        self.last_session_phase.insert(instrument_id, new_phase);
+        let state_snapshot = self.market_state.clone();
+        let audit_events_before = self.audit.events.len();
+        let new_orders = {
+            let mut ctx = StrategyContext::new(ts_ns, &state_snapshot, &mut self.audit);
+            self.strategy
+                .on_session_boundary(&mut ctx, instrument_id, new_phase)?;
+            ctx.drain_orders()
+        };
+        self.fail_on_new_strict_warnings(audit_events_before)?;
+        self.accept_context_orders(new_orders);
+        Ok(())
+    }
+
+    fn dispatch_rollover_boundary(&mut self, _event: &MarketEvent) -> Result<()> {
         Ok(())
     }
 
