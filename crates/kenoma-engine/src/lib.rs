@@ -15,8 +15,8 @@ use kenoma_stats::{
     compute_metrics_with, EquityPoint as StatsEquityPoint, MetricsConfig, TradePnl,
 };
 use kenoma_types::{
-    Bar, EquityPoint, Fill, InstrumentId, InstrumentSpec, MarketEvent, OrderRequest, Price, Quote,
-    RunMetrics, RunReport, SessionPhase, TimestampNs,
+    Bar, EquityPoint, Fill, InstrumentId, InstrumentSpec, MarketEvent, OrderRequest, OrderSide,
+    Price, Quote, RunMetrics, RunReport, SessionPhase, TimestampNs,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -360,8 +360,6 @@ pub struct BacktestEngine<S> {
     session_resolver: Box<dyn SessionResolver>,
     rollover_resolver: Box<dyn RolloverResolver>,
     last_session_phase: BTreeMap<InstrumentId, SessionPhase>,
-    // Read by dispatch_rollover_boundary (Task 9).
-    #[allow(dead_code)]
     last_active_contract: BTreeMap<String, String>,
 }
 
@@ -516,7 +514,65 @@ impl<S: Strategy> BacktestEngine<S> {
         Ok(())
     }
 
-    fn dispatch_rollover_boundary(&mut self, _event: &MarketEvent) -> Result<()> {
+    fn dispatch_rollover_boundary(&mut self, event: &MarketEvent) -> Result<()> {
+        let Some(instrument_id) = event.instrument_id() else {
+            return Ok(());
+        };
+        let Some(family) = self
+            .instruments
+            .get(&instrument_id)
+            .and_then(|spec| spec.contract.as_ref())
+            .and_then(|c| c.root.clone())
+        else {
+            return Ok(());
+        };
+        let ts_ns = event.timestamp_ns();
+        let new_contract = self.rollover_resolver.active_contract(ts_ns, &family);
+        let prior = self.last_active_contract.get(&family).cloned();
+
+        if prior.is_none() {
+            self.last_active_contract
+                .insert(family.clone(), new_contract);
+            return Ok(());
+        }
+        let prior = prior.unwrap();
+        if prior == new_contract {
+            return Ok(());
+        }
+
+        self.last_active_contract
+            .insert(family.clone(), new_contract.clone());
+        let state_snapshot = self.market_state.clone();
+        let audit_events_before = self.audit.events.len();
+        let new_orders = {
+            let mut ctx = StrategyContext::new(ts_ns, &state_snapshot, &mut self.audit);
+            self.strategy
+                .on_rollover_boundary(&mut ctx, &family, &prior, &new_contract)?;
+            ctx.drain_orders()
+        };
+        self.fail_on_new_strict_warnings(audit_events_before)?;
+        self.accept_context_orders(new_orders);
+
+        // Force-flat any open position on this instrument.
+        let qty = self
+            .portfolio
+            .positions_vec()
+            .into_iter()
+            .find(|p| p.instrument_id == instrument_id)
+            .map(|p| p.qty)
+            .unwrap_or(0.0);
+        if qty != 0.0 {
+            let side = if qty > 0.0 {
+                OrderSide::Sell
+            } else {
+                OrderSide::Buy
+            };
+            let abs_qty = qty.abs();
+            let mut order = OrderRequest::market(instrument_id, side, abs_qty);
+            order.id = 0;
+            order.tag = Some("ROLLOVER_BOUNDARY".to_string());
+            self.accept_context_orders(vec![order]);
+        }
         Ok(())
     }
 
@@ -624,6 +680,16 @@ impl<S: Strategy> BacktestEngine<S> {
     }
 
     fn apply_fill(&mut self, fill: Fill) -> Result<()> {
+        // Propagate order tag to fill liquidity (used by force-flat tagging).
+        let mut fill = fill;
+        if let Some(tag) = self
+            .orders
+            .iter()
+            .find(|o| o.id == fill.order_id)
+            .and_then(|o| o.tag.clone())
+        {
+            fill.liquidity = Some(tag);
+        }
         let spec = self
             .instruments
             .get(&fill.instrument_id)
