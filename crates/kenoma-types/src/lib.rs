@@ -299,6 +299,7 @@ impl MboEvent {
         fixed_to_price(self.price_fixed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_dbn_parts(
         ts: TimestampNs,
         order_id: u64,
@@ -435,19 +436,14 @@ pub enum OrderType {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimeInForce {
+    #[default]
     Day,
     Gtc,
     Ioc,
     Fok,
-}
-
-impl Default for TimeInForce {
-    fn default() -> Self {
-        Self::Day
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
