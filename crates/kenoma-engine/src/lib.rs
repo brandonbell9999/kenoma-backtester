@@ -183,6 +183,20 @@ pub struct ExecutionConfig {
     pub commission_per_side: f64,
     #[serde(default)]
     pub slippage_ticks: f64,
+    /// Opt-in switch for the hunger-games harness hooks.
+    ///
+    /// When `false` (the default), `on_session_boundary` and
+    /// `on_rollover_boundary` are NEVER fired and the engine NEVER consults
+    /// the session or rollover resolvers, even if they have been set via
+    /// `BacktestEngine::with_session_resolver` /
+    /// `BacktestEngine::with_rollover_resolver`. This guarantees that
+    /// existing consumers (es-sr-canvas, kenoma-fx, anything depending on
+    /// kenoma-backtester at v0.1.x) see byte-identical behaviour to baseline.
+    ///
+    /// When `true`, the engine consults the resolvers per event and fires
+    /// the boundary hooks on phase / active-contract changes.
+    #[serde(default)]
+    pub enable_hg_hooks: bool,
 }
 
 fn default_fill_policy_name() -> String {
@@ -201,6 +215,7 @@ impl Default for ExecutionConfig {
             fixed_spread_ticks: default_fixed_spread_ticks(),
             commission_per_side: 0.0,
             slippage_ticks: 0.0,
+            enable_hg_hooks: false,
         }
     }
 }
