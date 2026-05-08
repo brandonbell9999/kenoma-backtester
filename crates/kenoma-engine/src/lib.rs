@@ -15,14 +15,17 @@ use kenoma_stats::{
     compute_metrics_with, EquityPoint as StatsEquityPoint, MetricsConfig, TradePnl,
 };
 use kenoma_types::{
-    Bar, EquityPoint, Fill, InstrumentId, InstrumentSpec, MarketEvent, OrderRequest, Price, Quote,
-    RunMetrics, RunReport, TimestampNs,
+    Bar, EquityPoint, Fill, InstrumentId, InstrumentSpec, MarketEvent, OrderRequest, OrderSide,
+    Price, Quote, RunMetrics, RunReport, SessionPhase, TimestampNs,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
+
+mod resolvers;
+pub use resolvers::{AlwaysRth, RolloverResolver, SessionResolver, StaticContract};
 
 pub trait Strategy {
     fn on_event(&mut self, _ctx: &mut StrategyContext, _event: &MarketEvent) -> Result<()> {
@@ -34,6 +37,42 @@ pub trait Strategy {
     }
 
     fn on_fill(&mut self, _ctx: &mut StrategyContext, _fill: &Fill) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fired by the engine when the resolved session phase changes for an
+    /// instrument, AFTER `on_event`/`on_timer` for the current event has
+    /// returned and any orders it submitted have been drained.
+    ///
+    /// Only fired when `ExecutionConfig.enable_hg_hooks == true`. Default
+    /// impl is a no-op so existing strategies need not override.
+    fn on_session_boundary(
+        &mut self,
+        _ctx: &mut StrategyContext,
+        _instrument_id: InstrumentId,
+        _new_phase: SessionPhase,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fired by the engine when the resolved active contract changes for an
+    /// instrument family, AFTER `on_event`/`on_timer` for the current event
+    /// has returned and any orders it submitted have been drained.
+    ///
+    /// The engine queues a force-flat market order with
+    /// `reason="ROLLOVER_BOUNDARY"` for any open position on `old_contract`
+    /// AFTER this method returns and its orders are drained -- the strategy's
+    /// own flattening (if any) goes first, the engine's safety net second.
+    ///
+    /// Only fired when `ExecutionConfig.enable_hg_hooks == true`. Default
+    /// impl is a no-op.
+    fn on_rollover_boundary(
+        &mut self,
+        _ctx: &mut StrategyContext,
+        _instrument_family: &str,
+        _old_contract: &str,
+        _new_contract: &str,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -183,6 +222,20 @@ pub struct ExecutionConfig {
     pub commission_per_side: f64,
     #[serde(default)]
     pub slippage_ticks: f64,
+    /// Opt-in switch for the hunger-games harness hooks.
+    ///
+    /// When `false` (the default), `on_session_boundary` and
+    /// `on_rollover_boundary` are NEVER fired and the engine NEVER consults
+    /// the session or rollover resolvers, even if they have been set via
+    /// `BacktestEngine::with_session_resolver` /
+    /// `BacktestEngine::with_rollover_resolver`. This guarantees that
+    /// existing consumers (es-sr-canvas, kenoma-fx, anything depending on
+    /// kenoma-backtester at v0.1.x) see byte-identical behaviour to baseline.
+    ///
+    /// When `true`, the engine consults the resolvers per event and fires
+    /// the boundary hooks on phase / active-contract changes.
+    #[serde(default)]
+    pub enable_hg_hooks: bool,
 }
 
 fn default_fill_policy_name() -> String {
@@ -201,6 +254,7 @@ impl Default for ExecutionConfig {
             fixed_spread_ticks: default_fixed_spread_ticks(),
             commission_per_side: 0.0,
             slippage_ticks: 0.0,
+            enable_hg_hooks: false,
         }
     }
 }
@@ -303,6 +357,10 @@ pub struct BacktestEngine<S> {
     last_borrow_ts: BTreeMap<InstrumentId, TimestampNs>,
     last_funding_ts: BTreeMap<InstrumentId, TimestampNs>,
     next_order_id: u64,
+    session_resolver: Box<dyn SessionResolver>,
+    rollover_resolver: Box<dyn RolloverResolver>,
+    last_session_phase: BTreeMap<InstrumentId, SessionPhase>,
+    last_active_contract: BTreeMap<String, String>,
 }
 
 impl<S: Strategy> BacktestEngine<S> {
@@ -345,7 +403,21 @@ impl<S: Strategy> BacktestEngine<S> {
             last_borrow_ts: BTreeMap::new(),
             last_funding_ts: BTreeMap::new(),
             next_order_id: 1,
+            session_resolver: Box::new(AlwaysRth),
+            rollover_resolver: Box::new(StaticContract::new("__static__")),
+            last_session_phase: BTreeMap::new(),
+            last_active_contract: BTreeMap::new(),
         }
+    }
+
+    pub fn with_session_resolver(mut self, resolver: Box<dyn SessionResolver>) -> Self {
+        self.session_resolver = resolver;
+        self
+    }
+
+    pub fn with_rollover_resolver(mut self, resolver: Box<dyn RolloverResolver>) -> Self {
+        self.rollover_resolver = resolver;
+        self
     }
 
     pub fn run_manifest(strategy: S, manifest: RunManifest) -> Result<(RunReport, AuditTrail)> {
@@ -409,6 +481,98 @@ impl<S: Strategy> BacktestEngine<S> {
         };
         self.fail_on_new_strict_warnings(audit_events_before)?;
         self.accept_context_orders(new_orders);
+
+        if self.manifest.execution.enable_hg_hooks {
+            self.dispatch_session_boundary(event)?;
+            self.dispatch_rollover_boundary(event)?;
+        }
+
+        Ok(())
+    }
+
+    fn dispatch_session_boundary(&mut self, event: &MarketEvent) -> Result<()> {
+        let Some(instrument_id) = event.instrument_id() else {
+            return Ok(());
+        };
+        let ts_ns = event.timestamp_ns();
+        let new_phase = self.session_resolver.session_phase(ts_ns, instrument_id);
+        let prior = self.last_session_phase.get(&instrument_id).copied();
+        if prior == Some(new_phase) {
+            return Ok(());
+        }
+        self.last_session_phase.insert(instrument_id, new_phase);
+        let state_snapshot = self.market_state.clone();
+        let audit_events_before = self.audit.events.len();
+        let new_orders = {
+            let mut ctx = StrategyContext::new(ts_ns, &state_snapshot, &mut self.audit);
+            self.strategy
+                .on_session_boundary(&mut ctx, instrument_id, new_phase)?;
+            ctx.drain_orders()
+        };
+        self.fail_on_new_strict_warnings(audit_events_before)?;
+        self.accept_context_orders(new_orders);
+        Ok(())
+    }
+
+    fn dispatch_rollover_boundary(&mut self, event: &MarketEvent) -> Result<()> {
+        let Some(instrument_id) = event.instrument_id() else {
+            return Ok(());
+        };
+        let Some(family) = self
+            .instruments
+            .get(&instrument_id)
+            .and_then(|spec| spec.contract.as_ref())
+            .and_then(|c| c.root.clone())
+        else {
+            return Ok(());
+        };
+        let ts_ns = event.timestamp_ns();
+        let new_contract = self.rollover_resolver.active_contract(ts_ns, &family);
+        let prior = self.last_active_contract.get(&family).cloned();
+
+        if prior.is_none() {
+            self.last_active_contract
+                .insert(family.clone(), new_contract);
+            return Ok(());
+        }
+        let prior = prior.unwrap();
+        if prior == new_contract {
+            return Ok(());
+        }
+
+        self.last_active_contract
+            .insert(family.clone(), new_contract.clone());
+        let state_snapshot = self.market_state.clone();
+        let audit_events_before = self.audit.events.len();
+        let new_orders = {
+            let mut ctx = StrategyContext::new(ts_ns, &state_snapshot, &mut self.audit);
+            self.strategy
+                .on_rollover_boundary(&mut ctx, &family, &prior, &new_contract)?;
+            ctx.drain_orders()
+        };
+        self.fail_on_new_strict_warnings(audit_events_before)?;
+        self.accept_context_orders(new_orders);
+
+        // Force-flat any open position on this instrument.
+        let qty = self
+            .portfolio
+            .positions_vec()
+            .into_iter()
+            .find(|p| p.instrument_id == instrument_id)
+            .map(|p| p.qty)
+            .unwrap_or(0.0);
+        if qty != 0.0 {
+            let side = if qty > 0.0 {
+                OrderSide::Sell
+            } else {
+                OrderSide::Buy
+            };
+            let abs_qty = qty.abs();
+            let mut order = OrderRequest::market(instrument_id, side, abs_qty);
+            order.id = 0;
+            order.tag = Some("ROLLOVER_BOUNDARY".to_string());
+            self.accept_context_orders(vec![order]);
+        }
         Ok(())
     }
 
@@ -516,6 +680,16 @@ impl<S: Strategy> BacktestEngine<S> {
     }
 
     fn apply_fill(&mut self, fill: Fill) -> Result<()> {
+        // Propagate order tag to fill liquidity (used by force-flat tagging).
+        let mut fill = fill;
+        if let Some(tag) = self
+            .orders
+            .iter()
+            .find(|o| o.id == fill.order_id)
+            .and_then(|o| o.tag.clone())
+        {
+            fill.liquidity = Some(tag);
+        }
         let spec = self
             .instruments
             .get(&fill.instrument_id)
