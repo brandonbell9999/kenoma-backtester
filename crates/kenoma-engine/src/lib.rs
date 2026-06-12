@@ -15,8 +15,9 @@ use kenoma_stats::{
     compute_metrics_with, EquityPoint as StatsEquityPoint, MetricsConfig, TradePnl,
 };
 use kenoma_types::{
-    Bar, EquityPoint, Fill, InstrumentId, InstrumentSpec, MarketEvent, OrderRequest, OrderSide,
-    Price, Quote, RunMetrics, RunReport, SessionPhase, TimestampNs,
+    Bar, EquityPoint, Fill, InstrumentId, InstrumentSpec, MarketEvent, OrderId, OrderRequest,
+    OrderSide, OrderType, Price, Quote, RunMetrics, RunReport, SessionPhase, TimeInForce,
+    TimestampNs,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +27,8 @@ use std::path::{Path, PathBuf};
 
 mod resolvers;
 pub use resolvers::{AlwaysRth, RolloverResolver, SessionResolver, StaticContract};
+
+const NANOS_PER_DAY_U64: TimestampNs = 86_400_000_000_000;
 
 pub trait Strategy {
     fn on_event(&mut self, _ctx: &mut StrategyContext, _event: &MarketEvent) -> Result<()> {
@@ -118,15 +121,28 @@ pub struct StrategyContext<'a> {
     market_state: &'a MarketState,
     audit: &'a mut AuditTrail,
     orders: Vec<OrderRequest>,
+    active_order_ids: BTreeSet<OrderId>,
+    cancellations: Vec<OrderId>,
 }
 
 impl<'a> StrategyContext<'a> {
     pub fn new(now: TimestampNs, market_state: &'a MarketState, audit: &'a mut AuditTrail) -> Self {
+        Self::with_active_orders(now, market_state, audit, BTreeSet::new())
+    }
+
+    fn with_active_orders(
+        now: TimestampNs,
+        market_state: &'a MarketState,
+        audit: &'a mut AuditTrail,
+        active_order_ids: BTreeSet<OrderId>,
+    ) -> Self {
         Self {
             now,
             market_state,
             audit,
             orders: Vec::new(),
+            active_order_ids,
+            cancellations: Vec::new(),
         }
     }
 
@@ -185,8 +201,20 @@ impl<'a> StrategyContext<'a> {
         self.orders.push(order);
     }
 
+    pub fn cancel_order(&mut self, order_id: OrderId) -> bool {
+        if !self.active_order_ids.remove(&order_id) {
+            return false;
+        }
+        self.cancellations.push(order_id);
+        true
+    }
+
     pub fn drain_orders(&mut self) -> Vec<OrderRequest> {
         std::mem::take(&mut self.orders)
+    }
+
+    fn drain_cancellations(&mut self) -> Vec<OrderId> {
+        std::mem::take(&mut self.cancellations)
     }
 }
 
@@ -363,6 +391,12 @@ pub struct BacktestEngine<S> {
     last_active_contract: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone)]
+struct FillCandidate {
+    order: OrderRequest,
+    fill: Fill,
+}
+
 impl<S: Strategy> BacktestEngine<S> {
     pub fn new(strategy: S, manifest: RunManifest) -> Self {
         let instruments = manifest
@@ -435,6 +469,7 @@ impl<S: Strategy> BacktestEngine<S> {
             self.market_state.update(event);
             self.apply_marks();
             self.accrue_financing(event.timestamp_ns())?;
+            self.expire_resting_day_orders_at_trading_date_boundary(event.timestamp_ns());
             self.evaluate_pending_orders(event)?;
             self.update_mbo_book(event);
             self.dispatch_strategy_event(event)?;
@@ -443,13 +478,19 @@ impl<S: Strategy> BacktestEngine<S> {
         let end_ts = events.last().map(MarketEvent::timestamp_ns).unwrap_or(0);
         let state_snapshot = self.market_state.clone();
         let audit_events_before = self.audit.events.len();
-        let new_orders = {
-            let mut ctx = StrategyContext::new(end_ts, &state_snapshot, &mut self.audit);
+        let active_order_ids = self.active_order_ids();
+        let (cancellations, new_orders) = {
+            let mut ctx = StrategyContext::with_active_orders(
+                end_ts,
+                &state_snapshot,
+                &mut self.audit,
+                active_order_ids,
+            );
             self.strategy.on_end(&mut ctx)?;
-            ctx.drain_orders()
+            (ctx.drain_cancellations(), ctx.drain_orders())
         };
         self.fail_on_new_strict_warnings(audit_events_before)?;
-        self.accept_context_orders(new_orders);
+        self.apply_context_actions(cancellations, new_orders);
         self.record_equity(end_ts)?;
         Ok(self.report())
     }
@@ -470,17 +511,22 @@ impl<S: Strategy> BacktestEngine<S> {
     fn dispatch_strategy_event(&mut self, event: &MarketEvent) -> Result<()> {
         let state_snapshot = self.market_state.clone();
         let audit_events_before = self.audit.events.len();
-        let new_orders = {
-            let mut ctx =
-                StrategyContext::new(event.timestamp_ns(), &state_snapshot, &mut self.audit);
+        let active_order_ids = self.active_order_ids();
+        let (cancellations, new_orders) = {
+            let mut ctx = StrategyContext::with_active_orders(
+                event.timestamp_ns(),
+                &state_snapshot,
+                &mut self.audit,
+                active_order_ids,
+            );
             match event {
                 MarketEvent::Timer(timer) => self.strategy.on_timer(&mut ctx, &timer.name)?,
                 _ => self.strategy.on_event(&mut ctx, event)?,
             }
-            ctx.drain_orders()
+            (ctx.drain_cancellations(), ctx.drain_orders())
         };
         self.fail_on_new_strict_warnings(audit_events_before)?;
-        self.accept_context_orders(new_orders);
+        self.apply_context_actions(cancellations, new_orders);
 
         if self.manifest.execution.enable_hg_hooks {
             self.dispatch_session_boundary(event)?;
@@ -503,13 +549,23 @@ impl<S: Strategy> BacktestEngine<S> {
         self.last_session_phase.insert(instrument_id, new_phase);
         let state_snapshot = self.market_state.clone();
         let audit_events_before = self.audit.events.len();
-        let new_orders = {
-            let mut ctx = StrategyContext::new(ts_ns, &state_snapshot, &mut self.audit);
+        let active_order_ids = self.active_order_ids();
+        let (cancellations, new_orders) = {
+            let mut ctx = StrategyContext::with_active_orders(
+                ts_ns,
+                &state_snapshot,
+                &mut self.audit,
+                active_order_ids,
+            );
             self.strategy
                 .on_session_boundary(&mut ctx, instrument_id, new_phase)?;
-            ctx.drain_orders()
+            (ctx.drain_cancellations(), ctx.drain_orders())
         };
         self.fail_on_new_strict_warnings(audit_events_before)?;
+        self.apply_cancellations(cancellations);
+        if new_phase == SessionPhase::Halt {
+            self.cancel_resting_day_orders_for_instrument(instrument_id);
+        }
         self.accept_context_orders(new_orders);
         Ok(())
     }
@@ -544,14 +600,20 @@ impl<S: Strategy> BacktestEngine<S> {
             .insert(family.clone(), new_contract.clone());
         let state_snapshot = self.market_state.clone();
         let audit_events_before = self.audit.events.len();
-        let new_orders = {
-            let mut ctx = StrategyContext::new(ts_ns, &state_snapshot, &mut self.audit);
+        let active_order_ids = self.active_order_ids();
+        let (cancellations, new_orders) = {
+            let mut ctx = StrategyContext::with_active_orders(
+                ts_ns,
+                &state_snapshot,
+                &mut self.audit,
+                active_order_ids,
+            );
             self.strategy
                 .on_rollover_boundary(&mut ctx, &family, &prior, &new_contract)?;
-            ctx.drain_orders()
+            (ctx.drain_cancellations(), ctx.drain_orders())
         };
         self.fail_on_new_strict_warnings(audit_events_before)?;
-        self.accept_context_orders(new_orders);
+        self.apply_context_actions(cancellations, new_orders);
 
         // Force-flat any open position on this instrument.
         let qty = self
@@ -595,9 +657,61 @@ impl<S: Strategy> BacktestEngine<S> {
         }
     }
 
+    fn active_order_ids(&self) -> BTreeSet<OrderId> {
+        self.pending_orders.iter().map(|order| order.id).collect()
+    }
+
+    fn apply_context_actions(&mut self, cancellations: Vec<OrderId>, orders: Vec<OrderRequest>) {
+        self.apply_cancellations(cancellations);
+        self.accept_context_orders(orders);
+    }
+
+    fn apply_cancellations(&mut self, cancellations: Vec<OrderId>) {
+        let ids = cancellations.into_iter().collect::<BTreeSet<_>>();
+        self.remove_resting_order_ids(&ids);
+    }
+
+    fn remove_resting_order_ids(&mut self, order_ids: &BTreeSet<OrderId>) -> bool {
+        if order_ids.is_empty() {
+            return false;
+        }
+        let before_pending = self.pending_orders.len();
+        let before_trackers = self.mbo_limit_trackers.len();
+        self.pending_orders
+            .retain(|order| !order_ids.contains(&order.id));
+        self.mbo_limit_trackers
+            .retain(|tracker| !order_ids.contains(&tracker.order.id));
+        before_pending != self.pending_orders.len()
+            || before_trackers != self.mbo_limit_trackers.len()
+    }
+
+    fn expire_resting_day_orders_at_trading_date_boundary(&mut self, ts: TimestampNs) {
+        let current_date = trading_date_index(ts);
+        let expired = self
+            .pending_orders
+            .iter()
+            .filter(|order| {
+                is_resting_day_order(order) && trading_date_index(order.created_ts) < current_date
+            })
+            .map(|order| order.id)
+            .collect::<BTreeSet<_>>();
+        // GTC/IOC/FOK remain otherwise unenforced in M-A1; this gate only
+        // expires pre-existing resting Day orders at the date boundary.
+        self.remove_resting_order_ids(&expired);
+    }
+
+    fn cancel_resting_day_orders_for_instrument(&mut self, instrument_id: InstrumentId) {
+        let ids = self
+            .pending_orders
+            .iter()
+            .filter(|order| order.instrument_id == instrument_id && is_resting_day_order(order))
+            .map(|order| order.id)
+            .collect::<BTreeSet<_>>();
+        self.remove_resting_order_ids(&ids);
+    }
+
     fn evaluate_pending_orders(&mut self, event: &MarketEvent) -> Result<()> {
-        let mut fills = Vec::new();
-        let mut filled_order_ids = BTreeSet::new();
+        let mut candidates = Vec::new();
 
         if let MarketEvent::Mbo(mbo) = event {
             if let Some(book) = self.mbo_books.get(&mbo.instrument_id) {
@@ -613,8 +727,10 @@ impl<S: Strategy> BacktestEngine<S> {
                             continue;
                         };
                         if let Some(fill) = tracker.to_fill(spec, &self.fill_model.costs) {
-                            filled_order_ids.insert(fill.order_id);
-                            fills.push(fill);
+                            candidates.push(FillCandidate {
+                                order: tracker.order.clone(),
+                                fill,
+                            });
                         }
                     } else {
                         remaining_trackers.push(tracker);
@@ -635,28 +751,86 @@ impl<S: Strategy> BacktestEngine<S> {
                     continue;
                 };
                 if let Some(fill) = self.fill_model.try_fill(&order, event, spec) {
-                    filled_order_ids.insert(fill.order_id);
-                    fills.push(fill);
+                    candidates.push(FillCandidate {
+                        order: order.clone(),
+                        fill,
+                    });
                 } else {
                     remaining.push(order);
                 }
             }
             self.pending_orders = remaining;
         }
-        if !filled_order_ids.is_empty() {
-            self.pending_orders
-                .retain(|order| !filled_order_ids.contains(&order.id));
-            self.mbo_limit_trackers
-                .retain(|tracker| !filled_order_ids.contains(&tracker.order.id));
+        let selected = self.select_oco_fill_candidates(candidates);
+        if selected.is_empty() {
+            return Ok(());
         }
-        let had_fills = !fills.is_empty();
-        for fill in fills {
-            self.apply_fill(fill)?;
+        let filled_order_ids = selected
+            .iter()
+            .map(|candidate| candidate.fill.order_id)
+            .collect::<BTreeSet<_>>();
+        let mut remove_order_ids = filled_order_ids.clone();
+        remove_order_ids.extend(self.oco_sibling_order_ids(&selected));
+        self.remove_resting_order_ids(&remove_order_ids);
+
+        for candidate in selected {
+            self.apply_fill(candidate.fill)?;
         }
-        if had_fills {
-            self.apply_marks();
-        }
+        self.apply_marks();
         Ok(())
+    }
+
+    fn select_oco_fill_candidates(&self, candidates: Vec<FillCandidate>) -> Vec<FillCandidate> {
+        let mut selected = Vec::new();
+        let mut oco_indexes = BTreeMap::new();
+        for candidate in candidates {
+            let Some(group) = candidate.order.oco_group.clone() else {
+                selected.push(candidate);
+                continue;
+            };
+            if let Some(&selected_index) = oco_indexes.get(&group) {
+                if should_replace_oco_candidate(&selected[selected_index], &candidate) {
+                    selected[selected_index] = candidate;
+                }
+            } else {
+                oco_indexes.insert(group, selected.len());
+                selected.push(candidate);
+            }
+        }
+        selected
+    }
+
+    fn oco_sibling_order_ids(&self, selected: &[FillCandidate]) -> BTreeSet<OrderId> {
+        let filled_order_ids = selected
+            .iter()
+            .map(|candidate| candidate.fill.order_id)
+            .collect::<BTreeSet<_>>();
+        let filled_oco_groups = selected
+            .iter()
+            .filter_map(|candidate| candidate.order.oco_group.as_deref())
+            .collect::<BTreeSet<_>>();
+        if filled_oco_groups.is_empty() {
+            return BTreeSet::new();
+        }
+
+        self.pending_orders
+            .iter()
+            .map(|order| (order.id, order.oco_group.as_deref()))
+            .chain(
+                self.mbo_limit_trackers
+                    .iter()
+                    .map(|tracker| (tracker.order.id, tracker.order.oco_group.as_deref())),
+            )
+            .filter_map(|(order_id, oco_group)| {
+                if !filled_order_ids.contains(&order_id)
+                    && oco_group.is_some_and(|group| filled_oco_groups.contains(group))
+                {
+                    Some(order_id)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn active_mbo_tracked_order_ids(&self) -> BTreeSet<u64> {
@@ -698,13 +872,19 @@ impl<S: Strategy> BacktestEngine<S> {
         self.portfolio.apply_fill(&fill, &spec)?;
         let state_snapshot = self.market_state.clone();
         let audit_events_before = self.audit.events.len();
-        let new_orders = {
-            let mut ctx = StrategyContext::new(fill.ts, &state_snapshot, &mut self.audit);
+        let active_order_ids = self.active_order_ids();
+        let (cancellations, new_orders) = {
+            let mut ctx = StrategyContext::with_active_orders(
+                fill.ts,
+                &state_snapshot,
+                &mut self.audit,
+                active_order_ids,
+            );
             self.strategy.on_fill(&mut ctx, &fill)?;
-            ctx.drain_orders()
+            (ctx.drain_cancellations(), ctx.drain_orders())
         };
         self.fail_on_new_strict_warnings(audit_events_before)?;
-        self.accept_context_orders(new_orders);
+        self.apply_context_actions(cancellations, new_orders);
         self.fills.push(fill);
         Ok(())
     }
@@ -865,6 +1045,39 @@ impl<S: Strategy> BacktestEngine<S> {
 /// used so the silent default cannot mask a missing-cutoff data bug.
 fn effective_cutoff_ts(bar: &Bar) -> TimestampNs {
     bar.feature_cutoff_ts.unwrap_or(bar.ts_close)
+}
+
+fn should_replace_oco_candidate(current: &FillCandidate, candidate: &FillCandidate) -> bool {
+    match (
+        is_stop_like_order(&current.order),
+        is_stop_like_order(&candidate.order),
+    ) {
+        (false, true) => true,
+        (true, true) => is_more_adverse_stop_fill(&current.fill, &candidate.fill),
+        _ => false,
+    }
+}
+
+fn is_stop_like_order(order: &OrderRequest) -> bool {
+    matches!(
+        order.order_type,
+        OrderType::Stop { .. } | OrderType::StopLimit { .. }
+    )
+}
+
+fn is_more_adverse_stop_fill(current: &Fill, candidate: &Fill) -> bool {
+    match candidate.side {
+        OrderSide::Buy => candidate.price > current.price,
+        OrderSide::Sell => candidate.price < current.price,
+    }
+}
+
+fn is_resting_day_order(order: &OrderRequest) -> bool {
+    order.tif == TimeInForce::Day && !matches!(order.order_type, OrderType::Market)
+}
+
+fn trading_date_index(ts: TimestampNs) -> u64 {
+    ts / NANOS_PER_DAY_U64
 }
 
 fn realized_trade_pnls(
