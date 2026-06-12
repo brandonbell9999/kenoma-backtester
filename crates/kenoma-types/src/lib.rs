@@ -460,6 +460,8 @@ pub struct OrderRequest {
     pub created_ts: TimestampNs,
     #[serde(default)]
     pub tag: Option<String>,
+    #[serde(default)]
+    pub oco_group: Option<String>,
 }
 
 impl OrderRequest {
@@ -473,6 +475,7 @@ impl OrderRequest {
             tif: TimeInForce::Day,
             created_ts: 0,
             tag: None,
+            oco_group: None,
         }
     }
 
@@ -643,5 +646,23 @@ mod tests {
     fn price_fixed_round_trip() {
         let price = 4500.25;
         assert!((fixed_to_price(price_to_fixed(price)) - price).abs() < 1e-9);
+    }
+
+    #[test]
+    fn legacy_order_request_without_oco_group_deserializes_with_none() {
+        let json = r#"{
+            "id": 7,
+            "instrument_id": 1,
+            "side": "buy",
+            "qty": 2.0,
+            "order_type": "market",
+            "tif": "day",
+            "created_ts": 123,
+            "tag": null
+        }"#;
+        let order: OrderRequest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(order.id, 7);
+        assert_eq!(order.oco_group, None);
     }
 }
