@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use kenoma_backtester::engine::{
     BacktestEngine, BuyFirstBarStrategy, NoopStrategy, RunManifest, Strategy,
 };
+use kenoma_cli::EventWindowLongShort;
 use kenoma_data::{
     canonical_schema, read_bar_csv, read_bar_parquet, read_jsonl_events, write_jsonl_events,
 };
@@ -90,6 +91,10 @@ fn run_manifest(path: PathBuf) -> Result<()> {
                 .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
                 .unwrap_or(1.0);
             run_with_strategy(BuyFirstBarStrategy::new(instrument_id, qty), manifest)
+        }
+        "event_window_long_short" => {
+            let strat = EventWindowLongShort::from_params(&manifest.strategy.params)?;
+            run_with_strategy(strat, manifest)
         }
         other => bail!(
             "unknown built-in strategy '{other}'. Library users can run arbitrary Rust Strategy implementations through kenoma_engine."
