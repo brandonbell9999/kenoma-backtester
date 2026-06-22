@@ -7,29 +7,19 @@ use kenoma_types::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FillPolicy {
+    #[default]
     ConservativeCausal,
 }
 
-impl Default for FillPolicy {
-    fn default() -> Self {
-        Self::ConservativeCausal
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpreadModel {
+    #[default]
     Fixed,
     Empirical,
-}
-
-impl Default for SpreadModel {
-    fn default() -> Self {
-        Self::Fixed
-    }
 }
 
 /// How bar-only feeds fill market, stop, and limit orders.
@@ -55,18 +45,13 @@ impl Default for SpreadModel {
 ///
 /// **The default is `WorstCase`.** Idealized is opt-in because it produces
 /// fictional alpha in any strategy that detects level-touches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BarFillMode {
     Idealized,
+    #[default]
     WorstCase,
     PrintThroughLimit,
-}
-
-impl Default for BarFillMode {
-    fn default() -> Self {
-        Self::WorstCase
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

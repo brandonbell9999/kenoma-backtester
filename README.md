@@ -44,7 +44,15 @@ cargo run -p kenoma-cli --bin kenoma-bt -- run --manifest manifests/bar_smoke.to
 cargo run -p kenoma-cli --bin kenoma-bt -- audit --run-dir target/kenoma-runs/bar-smoke
 ```
 
-The library API is the primary strategy interface. The CLI includes built-in `noop` and `buy_first_bar` strategies for smoke testing manifests.
+The library API is the primary strategy interface. The CLI includes built-in
+`noop`, `buy_first_bar`, `event_window_long_short`, and `odte_debit_spread`
+strategies for smoke testing manifests and first-party bridge bundles.
+
+`odte_debit_spread` is the bridge strategy used by `kenoma-0DTE` exports. It
+expects a manifest with two option instruments plus `odte_entry` and `odte_exit`
+timer events. It buys the long leg, sells the short leg, then flattens the
+quantities that actually filled. It relies on quote events and the conservative
+causal fill model; it does not simulate broker-native multi-leg spread routing.
 
 ## Run Artifacts
 

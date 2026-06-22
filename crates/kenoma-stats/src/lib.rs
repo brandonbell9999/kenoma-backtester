@@ -50,7 +50,7 @@ impl Default for Metrics {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct MetricsConfig {
     /// Number of equity-curve return periods per year. Optional — when
     /// `None`, only the per-period Sharpe is reported. Setting this is the
@@ -58,14 +58,6 @@ pub struct MetricsConfig {
     /// implied frequency. Common values: 252 (daily), 252×6.5×60 (1-min RTH),
     /// 252×6.5×3600 (1-sec RTH).
     pub annualization_factor: Option<f64>,
-}
-
-impl Default for MetricsConfig {
-    fn default() -> Self {
-        Self {
-            annualization_factor: None,
-        }
-    }
 }
 
 pub fn compute_metrics(equity_curve: &[EquityPoint], trade_pnls: &[TradePnl]) -> Metrics {
@@ -252,7 +244,7 @@ pub fn assign_groups(n_days: usize, n_groups: usize) -> Vec<usize> {
         } else {
             base_size
         };
-        groups.extend(std::iter::repeat(group).take(size));
+        groups.extend(std::iter::repeat_n(group, size));
     }
     groups
 }

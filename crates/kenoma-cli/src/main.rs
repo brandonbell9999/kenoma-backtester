@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use kenoma_backtester::engine::{
     BacktestEngine, BuyFirstBarStrategy, NoopStrategy, RunManifest, Strategy,
 };
-use kenoma_cli::EventWindowLongShort;
+use kenoma_cli::{EventWindowLongShort, OdteDebitSpread};
 use kenoma_data::{
     canonical_schema, read_bar_csv, read_bar_parquet, read_jsonl_events, write_jsonl_events,
 };
@@ -94,6 +94,10 @@ fn run_manifest(path: PathBuf) -> Result<()> {
         }
         "event_window_long_short" => {
             let strat = EventWindowLongShort::from_params(&manifest.strategy.params)?;
+            run_with_strategy(strat, manifest)
+        }
+        "odte_debit_spread" => {
+            let strat = OdteDebitSpread::from_params(&manifest.strategy.params)?;
             run_with_strategy(strat, manifest)
         }
         other => bail!(

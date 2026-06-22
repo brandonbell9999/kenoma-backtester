@@ -315,11 +315,11 @@ mod tests {
     #[test]
     fn add_order_builds_bbo() {
         let mut bb = make_builder();
-        bb.process_event(1000, 100, 1, 'A', 'B', 4500_000_000_000, 10, 0);
-        bb.process_event(1000, 101, 1, 'A', 'A', 4501_000_000_000, 5, F_LAST);
+        bb.process_event(1000, 100, 1, 'A', 'B', 4_500_000_000_000, 10, 0);
+        bb.process_event(1000, 101, 1, 'A', 'A', 4_501_000_000_000, 5, F_LAST);
 
-        assert_eq!(bb.best_bid_price(), Some(4500_000_000_000));
-        assert_eq!(bb.best_ask_price(), Some(4501_000_000_000));
+        assert_eq!(bb.best_bid_price(), Some(4_500_000_000_000));
+        assert_eq!(bb.best_ask_price(), Some(4_501_000_000_000));
         assert_eq!(bb.best_bid_size(), 10);
         assert_eq!(bb.best_ask_size(), 5);
     }
@@ -327,54 +327,63 @@ mod tests {
     #[test]
     fn cancel_removes_order() {
         let mut bb = make_builder();
-        bb.process_event(1000, 100, 1, 'A', 'B', 4500_000_000_000, 10, F_LAST);
-        bb.process_event(2000, 100, 1, 'C', 'B', 4500_000_000_000, 0, F_LAST);
+        bb.process_event(1000, 100, 1, 'A', 'B', 4_500_000_000_000, 10, F_LAST);
+        bb.process_event(2000, 100, 1, 'C', 'B', 4_500_000_000_000, 0, F_LAST);
         assert_eq!(bb.best_bid_price(), None);
     }
 
     #[test]
     fn modify_updates_price_and_size() {
         let mut bb = make_builder();
-        bb.process_event(1000, 100, 1, 'A', 'B', 4500_000_000_000, 10, F_LAST);
-        bb.process_event(2000, 100, 1, 'M', 'B', 4501_000_000_000, 15, F_LAST);
-        assert_eq!(bb.best_bid_price(), Some(4501_000_000_000));
+        bb.process_event(1000, 100, 1, 'A', 'B', 4_500_000_000_000, 10, F_LAST);
+        bb.process_event(2000, 100, 1, 'M', 'B', 4_501_000_000_000, 15, F_LAST);
+        assert_eq!(bb.best_bid_price(), Some(4_501_000_000_000));
         assert_eq!(bb.best_bid_size(), 15);
     }
 
     #[test]
     fn fill_does_not_mutate_book() {
         let mut bb = make_builder();
-        bb.process_event(1000, 100, 1, 'A', 'B', 4500_000_000_000, 10, F_LAST);
-        bb.process_event(2000, 100, 1, 'F', 'B', 4500_000_000_000, 7, F_LAST);
+        bb.process_event(1000, 100, 1, 'A', 'B', 4_500_000_000_000, 10, F_LAST);
+        bb.process_event(2000, 100, 1, 'F', 'B', 4_500_000_000_000, 7, F_LAST);
         assert_eq!(bb.best_bid_size(), 10);
     }
 
     #[test]
     fn instrument_filter_ignores_other_instruments() {
         let mut bb = make_builder();
-        bb.process_event(1000, 100, 99, 'A', 'B', 4500_000_000_000, 10, F_LAST);
+        bb.process_event(1000, 100, 99, 'A', 'B', 4_500_000_000_000, 10, F_LAST);
         assert_eq!(bb.best_bid_price(), None);
     }
 
     #[test]
     fn committed_state_has_mid_and_depth() {
         let mut bb = make_builder();
-        bb.process_event(1_000_000_000, 100, 1, 'A', 'B', 4500_000_000_000, 10, 0);
-        bb.process_event(1_000_000_000, 101, 1, 'A', 'A', 4501_000_000_000, 5, F_LAST);
+        bb.process_event(1_000_000_000, 100, 1, 'A', 'B', 4_500_000_000_000, 10, 0);
+        bb.process_event(
+            1_000_000_000,
+            101,
+            1,
+            'A',
+            'A',
+            4_501_000_000_000,
+            5,
+            F_LAST,
+        );
 
         let cs = bb.current_committed_state(1_000_000_000);
         assert!(cs.has_bid);
         assert!(cs.has_ask);
         assert!((cs.mid - 4500.5).abs() < 0.01);
-        assert_eq!(bb.queue_ahead_at(Side::Bid, 4500_000_000_000), 10);
+        assert_eq!(bb.queue_ahead_at(Side::Bid, 4_500_000_000_000), 10);
     }
 
     #[test]
     fn flow_tracks_trade() {
         let mut bb = make_builder();
-        bb.process_event(1, 100, 1, 'A', 'B', 4500_000_000_000, 10, 0);
-        bb.process_event(1, 101, 1, 'A', 'A', 4501_000_000_000, 5, F_LAST);
-        bb.process_event(2, 0, 1, 'T', 'B', 4501_000_000_000, 3, F_LAST);
+        bb.process_event(1, 100, 1, 'A', 'B', 4_500_000_000_000, 10, 0);
+        bb.process_event(1, 101, 1, 'A', 'A', 4_501_000_000_000, 5, F_LAST);
+        bb.process_event(2, 0, 1, 'T', 'B', 4_501_000_000_000, 3, F_LAST);
         assert!(bb.current_flow_state().trade_flow[0] > 0.0);
     }
 }
