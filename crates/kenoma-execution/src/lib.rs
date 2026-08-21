@@ -332,6 +332,7 @@ impl ConservativeCausalFillModel {
             qty: order.qty,
             fee: self.costs.order_fee(spec, order.qty, price, taker),
             liquidity: Some(if taker { "taker" } else { "maker" }.to_string()),
+            tag: None,
         })
     }
 }
@@ -507,6 +508,7 @@ impl MboLimitFillTracker {
                 false,
             ),
             liquidity: Some("maker".to_string()),
+            tag: None,
         })
     }
 }

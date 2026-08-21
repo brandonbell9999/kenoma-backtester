@@ -163,12 +163,19 @@ fn on_rollover_boundary_fires_on_contract_change_and_force_flats_open_position()
         report.fills.len()
     );
 
-    // Force-flat fill should carry the ROLLOVER_BOUNDARY tag.
+    // Force-flat fill should carry the ROLLOVER_BOUNDARY tag without
+    // overwriting maker/taker liquidity.
     let flat_fill = &report.fills[1];
     assert_eq!(
-        flat_fill.liquidity.as_deref(),
+        flat_fill.tag.as_deref(),
         Some("ROLLOVER_BOUNDARY"),
-        "force-flat fill should have liquidity=ROLLOVER_BOUNDARY; got: {:?}",
+        "force-flat fill should have tag=ROLLOVER_BOUNDARY; got: {:?}",
+        flat_fill.tag
+    );
+    assert_eq!(
+        flat_fill.liquidity.as_deref(),
+        Some("taker"),
+        "force-flat fill should preserve taker liquidity; got: {:?}",
         flat_fill.liquidity
     );
 

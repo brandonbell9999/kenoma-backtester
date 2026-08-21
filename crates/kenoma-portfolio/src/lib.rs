@@ -286,6 +286,7 @@ mod tests {
                     qty: 2.0,
                     fee: 0.0,
                     liquidity: None,
+                    tag: None,
                 },
                 &spec,
             )
@@ -312,6 +313,7 @@ mod tests {
                     qty: 10.0,
                     fee: 0.0,
                     liquidity: None,
+                    tag: None,
                 },
                 &spec,
             )
@@ -336,6 +338,7 @@ mod tests {
                     qty: 1.0,
                     fee: 2.0,
                     liquidity: None,
+                    tag: None,
                 },
                 &spec,
             )
@@ -361,6 +364,7 @@ mod tests {
                     qty: 10.0,
                     fee: 0.0,
                     liquidity: None,
+                    tag: None,
                 },
                 &spec,
             )

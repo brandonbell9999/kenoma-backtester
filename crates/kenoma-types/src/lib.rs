@@ -525,6 +525,8 @@ pub struct Fill {
     pub fee: f64,
     #[serde(default)]
     pub liquidity: Option<String>,
+    #[serde(default)]
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -664,5 +666,24 @@ mod tests {
 
         assert_eq!(order.id, 7);
         assert_eq!(order.oco_group, None);
+    }
+
+    #[test]
+    fn legacy_fill_without_tag_deserializes_with_none() {
+        let json = r#"{
+            "order_id": 7,
+            "instrument_id": 1,
+            "ts": 123,
+            "side": "buy",
+            "price": 100.0,
+            "qty": 2.0,
+            "fee": 0.5,
+            "liquidity": "taker"
+        }"#;
+        let fill: Fill = serde_json::from_str(json).unwrap();
+
+        assert_eq!(fill.order_id, 7);
+        assert_eq!(fill.liquidity.as_deref(), Some("taker"));
+        assert_eq!(fill.tag, None);
     }
 }

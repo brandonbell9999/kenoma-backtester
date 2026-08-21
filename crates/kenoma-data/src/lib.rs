@@ -161,7 +161,7 @@ pub fn read_bar_csv(path: impl AsRef<Path>) -> Result<Vec<MarketEvent>> {
             close: row.close,
             volume: row.volume,
             vwap: row.vwap,
-            feature_cutoff_ts: row.feature_cutoff_ts.or(Some(row.ts_close)),
+            feature_cutoff_ts: row.feature_cutoff_ts,
         }));
     }
     events.sort_by_key(|event| (event.timestamp_ns(), event.priority()));
@@ -232,6 +232,7 @@ pub fn canonical_schema() -> CanonicalSchema {
             field("qty", "float64", false),
             field("order_type", "utf8", false),
             field("tag", "utf8", true),
+            field("oco_group", "utf8", true),
         ],
         fills: vec![
             field("order_id", "uint64", false),
@@ -242,6 +243,7 @@ pub fn canonical_schema() -> CanonicalSchema {
             field("qty", "float64", false),
             field("fee", "float64", false),
             field("liquidity", "utf8", true),
+            field("tag", "utf8", true),
         ],
     }
 }
@@ -452,6 +454,7 @@ mod parquet_artifacts {
             Field::new("qty", DataType::Float64, false),
             Field::new("order_type", DataType::Utf8, false),
             Field::new("tag", DataType::Utf8, true),
+            Field::new("oco_group", DataType::Utf8, true),
         ]));
         let order_types = orders
             .iter()
@@ -489,6 +492,12 @@ mod parquet_artifacts {
                     .map(|order| order.tag.as_deref())
                     .collect::<Vec<Option<&str>>>(),
             )),
+            Arc::new(StringArray::from(
+                orders
+                    .iter()
+                    .map(|order| order.oco_group.as_deref())
+                    .collect::<Vec<Option<&str>>>(),
+            )),
         ];
         write_batch(path, schema, columns)
     }
@@ -503,6 +512,7 @@ mod parquet_artifacts {
             Field::new("qty", DataType::Float64, false),
             Field::new("fee", DataType::Float64, false),
             Field::new("liquidity", DataType::Utf8, true),
+            Field::new("tag", DataType::Utf8, true),
         ]));
         let columns: Vec<ArrayRef> = vec![
             Arc::new(UInt64Array::from(
@@ -536,6 +546,12 @@ mod parquet_artifacts {
                 fills
                     .iter()
                     .map(|fill| fill.liquidity.as_deref())
+                    .collect::<Vec<Option<&str>>>(),
+            )),
+            Arc::new(StringArray::from(
+                fills
+                    .iter()
+                    .map(|fill| fill.tag.as_deref())
                     .collect::<Vec<Option<&str>>>(),
             )),
         ];
@@ -679,7 +695,9 @@ mod tests {
     fn schema_contains_required_fill_fields() {
         let schema = canonical_schema();
         assert!(schema.fills.iter().any(|field| field.name == "order_id"));
+        assert!(schema.fills.iter().any(|field| field.name == "tag"));
         assert!(schema.mbo.iter().any(|field| field.name == "price_fixed"));
+        assert!(schema.orders.iter().any(|field| field.name == "oco_group"));
         assert_eq!(
             schema
                 .orders
@@ -687,6 +705,34 @@ mod tests {
                 .find(|field| field.name == "order_type")
                 .map(|field| field.dtype.as_str()),
             Some("utf8")
+        );
+    }
+
+    #[test]
+    fn bar_csv_preserves_missing_feature_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bars-no-cutoff.csv");
+        std::fs::write(
+            &path,
+            "instrument_id,ts_open,ts_close,open,high,low,close,volume\n\
+             1,0,60,100.0,101.0,99.0,100.5,1000.0\n",
+        )
+        .unwrap();
+        let loaded = read_bar_csv(&path).unwrap();
+        assert_eq!(
+            loaded,
+            vec![MarketEvent::Bar(Bar {
+                instrument_id: 1,
+                ts_open: 0,
+                ts_close: 60,
+                open: 100.0,
+                high: 101.0,
+                low: 99.0,
+                close: 100.5,
+                volume: 1000.0,
+                vwap: None,
+                feature_cutoff_ts: None,
+            })]
         );
     }
 
@@ -789,11 +835,9 @@ mod tests {
         let orders_path = dir.path().join("orders.parquet");
         let fills_path = dir.path().join("fills.parquet");
 
-        write_orders_parquet(
-            &orders_path,
-            &[OrderRequest::market(1, OrderSide::Buy, 1.0)],
-        )
-        .unwrap();
+        let mut oco_order = OrderRequest::market(1, OrderSide::Buy, 1.0);
+        oco_order.oco_group = Some("bracket-a".to_string());
+        write_orders_parquet(&orders_path, &[oco_order]).unwrap();
         write_fills_parquet(
             &fills_path,
             &[Fill {
@@ -805,6 +849,7 @@ mod tests {
                 qty: 1.0,
                 fee: 0.0,
                 liquidity: None,
+                tag: Some("ROLLOVER_BOUNDARY".to_string()),
             }],
         )
         .unwrap();
@@ -820,6 +865,14 @@ mod tests {
         let tag_idx = orders_batch.schema().index_of("tag").unwrap();
         assert!(orders_batch.schema().field(tag_idx).is_nullable());
         assert!(orders_batch.column(tag_idx).is_null(0));
+        let oco_idx = orders_batch.schema().index_of("oco_group").unwrap();
+        assert!(orders_batch.schema().field(oco_idx).is_nullable());
+        let oco_group = orders_batch
+            .column(oco_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(oco_group.value(0), "bracket-a");
 
         let fills_file = File::open(&fills_path).unwrap();
         let fills_batch = ParquetRecordBatchReaderBuilder::try_new(fills_file)
@@ -832,6 +885,14 @@ mod tests {
         let liquidity_idx = fills_batch.schema().index_of("liquidity").unwrap();
         assert!(fills_batch.schema().field(liquidity_idx).is_nullable());
         assert!(fills_batch.column(liquidity_idx).is_null(0));
+        let fill_tag_idx = fills_batch.schema().index_of("tag").unwrap();
+        assert!(fills_batch.schema().field(fill_tag_idx).is_nullable());
+        let fill_tag = fills_batch
+            .column(fill_tag_idx)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(fill_tag.value(0), "ROLLOVER_BOUNDARY");
     }
 
     #[cfg(feature = "parquet")]

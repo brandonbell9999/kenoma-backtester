@@ -63,7 +63,7 @@ pub trait Strategy {
     /// has returned and any orders it submitted have been drained.
     ///
     /// The engine queues a force-flat market order with
-    /// `reason="ROLLOVER_BOUNDARY"` for any open position on `old_contract`
+    /// `tag="ROLLOVER_BOUNDARY"` for any open position on `old_contract`
     /// AFTER this method returns and its orders are drained -- the strategy's
     /// own flattening (if any) goes first, the engine's safety net second.
     ///
@@ -854,7 +854,7 @@ impl<S: Strategy> BacktestEngine<S> {
     }
 
     fn apply_fill(&mut self, fill: Fill) -> Result<()> {
-        // Propagate order tag to fill liquidity (used by force-flat tagging).
+        // Propagate order provenance without overwriting maker/taker liquidity.
         let mut fill = fill;
         if let Some(tag) = self
             .orders
@@ -862,7 +862,7 @@ impl<S: Strategy> BacktestEngine<S> {
             .find(|o| o.id == fill.order_id)
             .and_then(|o| o.tag.clone())
         {
-            fill.liquidity = Some(tag);
+            fill.tag = Some(tag);
         }
         let spec = self
             .instruments
@@ -1679,6 +1679,32 @@ mod tests {
     }
 
     #[test]
+    fn strict_manifest_rejects_bar_csv_without_feature_cutoff_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_path = dir.path().join("bars.csv");
+        std::fs::write(
+            &data_path,
+            "instrument_id,ts_open,ts_close,open,high,low,close,volume\n1,0,10,100,100,100,100,1\n",
+        )
+        .unwrap();
+
+        let mut strict_manifest = manifest();
+        strict_manifest.validation.strict = true;
+        strict_manifest.data = vec![DataSourceConfig {
+            kind: kenoma_data::DataSourceKind::BarCsv,
+            path: data_path,
+            instrument_id: None,
+            date: None,
+        }];
+
+        let err = BacktestEngine::run_manifest(NoopStrategy, strict_manifest).unwrap_err();
+        assert!(
+            err.to_string().contains("no feature_cutoff_ts"),
+            "expected CSV missing-cutoff diagnostic, got: {err}"
+        );
+    }
+
+    #[test]
     fn warn_mode_accepts_bar_with_missing_feature_cutoff_ts() {
         // Permissive default for backwards-compat: Warn mode silently falls
         // back to ts_close. Strict mode is the gate.
@@ -1733,6 +1759,7 @@ mod tests {
                 qty: 1.0,
                 fee: 0.0,
                 liquidity: None,
+                tag: None,
             },
             Fill {
                 order_id: 2,
@@ -1743,6 +1770,7 @@ mod tests {
                 qty: 1.0,
                 fee: 0.0,
                 liquidity: None,
+                tag: None,
             },
         ];
         let pnls = realized_trade_pnls(&fills, &instruments);
@@ -1763,6 +1791,7 @@ mod tests {
                 qty: 1.0,
                 fee: 1.0,
                 liquidity: None,
+                tag: None,
             },
             Fill {
                 order_id: 2,
@@ -1773,6 +1802,7 @@ mod tests {
                 qty: 1.0,
                 fee: 1.0,
                 liquidity: None,
+                tag: None,
             },
         ];
         let pnls = realized_trade_pnls(&fills, &instruments);
@@ -1902,6 +1932,7 @@ mod tests {
                 qty: 1.0,
                 fee: 0.0,
                 liquidity: None,
+                tag: None,
             },
             Fill {
                 order_id: 2,
@@ -1912,6 +1943,7 @@ mod tests {
                 qty: 1.0,
                 fee: 0.0,
                 liquidity: None,
+                tag: None,
             },
         ];
         let pnls = realized_trade_pnls(&fills, &instruments);
