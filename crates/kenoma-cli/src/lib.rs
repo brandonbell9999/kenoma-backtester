@@ -44,7 +44,7 @@ pub struct EventWindowLongShort {
 }
 
 /// Timer-driven 0DTE debit-spread strategy for bundles emitted by
-/// `kenoma-0DTE`.
+/// downstream consumers.
 ///
 /// The strategy expects quote events for two option instruments:
 /// - `odte_entry` timer: buy the long leg and sell the short leg.

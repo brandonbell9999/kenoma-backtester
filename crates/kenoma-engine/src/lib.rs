@@ -257,7 +257,7 @@ pub struct ExecutionConfig {
     /// the session or rollover resolvers, even if they have been set via
     /// `BacktestEngine::with_session_resolver` /
     /// `BacktestEngine::with_rollover_resolver`. This guarantees that
-    /// existing consumers (es-sr-canvas, kenoma-fx, anything depending on
+    /// existing downstream consumers (anything depending on
     /// kenoma-backtester at v0.1.x) see byte-identical behaviour to baseline.
     ///
     /// When `true`, the engine consults the resolvers per event and fires

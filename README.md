@@ -25,16 +25,25 @@ settlement convention:
 | `worst_case` (default) | `high + half_spread` (buy) / `low - half_spread` (sell) | `max(open, stop, high) + half_spread` (buy) / symmetric | fills on touch at `limit_price` |
 | `print_through_limit` | same as `worst_case` | same as `worst_case` | requires bar to print *through* the level (low strictly below limit by ≥ ½ tick) before filling |
 
-`idealized` is the trap class identified in
-`~/LOCAL_DEV/CLAUDE.md` (the es-sr-canvas Sharpe +4.00 → −2.12 collapse came
-from idealized bar-limit fills). It is opt-in only. **For deploy decisions,
+`idealized` credits fills at prices the bar may never have traded at. In our
+internal testing it inflated one strategy's Sharpe from −2.12 under realistic
+fills to +4.00. It is opt-in only. **For deploy decisions,
 do not trust idealized numbers without re-validating under at least
 `worst_case` for market/stop fills and `print_through_limit` for any
 strategy whose entry depends on level-touch.**
 
 The bar-fill price model is **only a coarse proxy** for execution realism on
-sparse OHLCV. Validate any fill-sensitive strategy against MBO/L2 (see
-`validate_limit_fills_against_mbo`) before allocating capital.
+sparse OHLCV. Validate any fill-sensitive strategy against MBO/L2 (the
+`kenoma_execution::MboLimitFillTracker` queue-ahead model is the entry point)
+before allocating capital.
+
+## Prerequisites
+
+A stable Rust toolchain (`rustup default stable`). No external market data is
+needed: `cargo test --workspace` and the `bar_smoke` quickstart below run
+entirely on the checked-in `examples/bar_smoke.csv`. `manifests/bar_smoke.toml`
+writes its run artifacts to `target/kenoma-runs/bar-smoke/` relative to the
+repo root.
 
 ## CLI
 
@@ -48,8 +57,8 @@ The library API is the primary strategy interface. The CLI includes built-in
 `noop`, `buy_first_bar`, `event_window_long_short`, and `odte_debit_spread`
 strategies for smoke testing manifests and first-party bridge bundles.
 
-`odte_debit_spread` is the bridge strategy used by `kenoma-0DTE` exports. It
-expects a manifest with two option instruments plus `odte_entry` and `odte_exit`
+`odte_debit_spread` is the bridge strategy used by a downstream options project's
+exports. It expects a manifest with two option instruments plus `odte_entry` and `odte_exit`
 timer events. It buys the long leg, sells the short leg, then flattens the
 quantities that actually filled. It relies on quote events and the conservative
 causal fill model; it does not simulate broker-native multi-leg spread routing.

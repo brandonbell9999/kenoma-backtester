@@ -1,9 +1,9 @@
 //! Resolver traits for session-aware and rollover-aware backtesting.
 //!
 //! These traits are the integration surface between the timestamp-ordered
-//! backtest engine and external calendar implementations. M-bt ships the
-//! traits + no-op-equivalent defaults; M2's `harness/calendars-loader/`
-//! provides the production impls against the M0 calendar TOMLs.
+//! backtest engine and external calendar implementations. This crate ships the
+//! traits + no-op-equivalent defaults; an external calendars loader
+//! provides the production impls against its calendar definitions.
 //!
 //! When `ExecutionConfig.enable_hg_hooks` is `false` (the default), the
 //! engine NEVER consults these resolvers, so user-supplied impls have no

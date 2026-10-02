@@ -39,6 +39,13 @@ fn instrument() -> InstrumentSpec {
     }
 }
 
+/// Unique scratch output dir. These tests never call `write_artifacts`, so
+/// nothing is written here; `keep()` hands back the path without tying its
+/// lifetime to this helper.
+fn output_dir() -> std::path::PathBuf {
+    tempfile::tempdir().expect("tempdir").keep()
+}
+
 fn manifest_with_default_execution() -> RunManifest {
     RunManifest {
         run: RunSection {
@@ -59,7 +66,7 @@ fn manifest_with_default_execution() -> RunManifest {
         validation: ValidationConfig { strict: false },
         metrics: Default::default(),
         output: OutputConfig {
-            dir: std::path::PathBuf::from("/tmp/hg_hooks_disabled_test"),
+            dir: output_dir(),
         },
     }
 }

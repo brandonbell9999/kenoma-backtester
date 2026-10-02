@@ -38,6 +38,13 @@ fn instrument() -> InstrumentSpec {
     }
 }
 
+/// Unique scratch output dir. These tests never call `write_artifacts`, so
+/// nothing is written here; `keep()` hands back the path without tying its
+/// lifetime to this helper.
+fn output_dir() -> std::path::PathBuf {
+    tempfile::tempdir().expect("tempdir").keep()
+}
+
 fn manifest(run_id: &str, enable_hg_hooks: bool) -> RunManifest {
     RunManifest {
         run: RunSection {
@@ -63,7 +70,7 @@ fn manifest(run_id: &str, enable_hg_hooks: bool) -> RunManifest {
         validation: ValidationConfig { strict: false },
         metrics: Default::default(),
         output: OutputConfig {
-            dir: std::path::PathBuf::from(format!("/tmp/{run_id}")),
+            dir: output_dir(),
         },
     }
 }

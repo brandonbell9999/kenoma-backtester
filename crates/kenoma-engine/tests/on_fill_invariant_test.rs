@@ -36,6 +36,13 @@ fn instrument() -> InstrumentSpec {
     }
 }
 
+/// Unique scratch output dir. These tests never call `write_artifacts`, so
+/// nothing is written here; `keep()` hands back the path without tying its
+/// lifetime to this helper.
+fn output_dir() -> std::path::PathBuf {
+    tempfile::tempdir().expect("tempdir").keep()
+}
+
 fn manifest() -> RunManifest {
     RunManifest {
         run: RunSection {
@@ -56,7 +63,7 @@ fn manifest() -> RunManifest {
         validation: ValidationConfig { strict: false },
         metrics: Default::default(),
         output: OutputConfig {
-            dir: std::path::PathBuf::from("/tmp/fill_invariant_test"),
+            dir: output_dir(),
         },
     }
 }

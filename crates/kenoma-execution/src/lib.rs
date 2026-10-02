@@ -30,8 +30,8 @@ pub enum SpreadModel {
 ///
 /// - [`BarFillMode::Idealized`]: market at `open ± half_spread`; limits at
 ///   `limit_price` whenever `bar.low ≤ limit` (buy) / `bar.high ≥ limit`
-///   (sell). This is the **trap class** that produced the es-sr-canvas
-///   Sharpe +4.00 → −2.12 collapse: a wick that touched the level but never
+///   (sell). This is the **trap class** that inflated one internal strategy's
+///   Sharpe from −2.12 to +4.00: a wick that touched the level but never
 ///   traded through it would still fill. Opt-in only.
 /// - [`BarFillMode::WorstCase`] (default): market and stop fills land at the
 ///   *worst* tick of the bar (high+half_spread for buys, low−half_spread for
@@ -211,8 +211,8 @@ impl ConservativeCausalFillModel {
         // available at the bar's open print or at any specific level inside the
         // bar. Treating it as a fill-size gate is a coarse upper bound, not a
         // realistic liquidity check. For deploy decisions that depend on
-        // executable size at specific prices, validate against MBO/L2 — see the
-        // user's `validate_limit_fills_against_mbo` procedure.
+        // executable size at specific prices, validate against MBO/L2 (see
+        // `MboLimitFillTracker`).
         if !has_sufficient_qty(bar.volume, order.qty) {
             return None;
         }
